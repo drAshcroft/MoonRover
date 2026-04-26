@@ -1,0 +1,584 @@
+# Moon Rover Configuration
+# Per System 4 - Rover Mechanics, Actuation, Power, and Sensor Integration
+# This file defines multiple rover drive configurations (profiles) that can be
+# selected, along with arm, manipulator, and power system parameters.
+
+# ============================================================================
+# ROVER PROFILES - SELECTABLE DRIVE CONFIGURATIONS
+# ============================================================================
+
+profiles:
+
+  # ========================================================================
+  # PROFILE 1: TWO-WHEEL DIFFERENTIAL DRIVE
+  # ========================================================================
+  two_wheel_diff:
+    # Profile display name
+    # Segway-style self-balancing platform: two lateral drive wheels, no
+    # casters, no skids. The chassis is a slim column whose center of mass
+    # sits above the wheel axle — balance is maintained by a PD controller
+    # in the demo stack, not by static stability.
+    name: "Two-Wheel Differential Drive"
+
+    # Number of wheels on this rover
+    num_wheels: 2
+
+    # Track width (distance between left and right wheel centers) in meters.
+    # Wider = more roll stability, larger turning radius.
+    track_width_m: 0.6
+
+    # Wheelbase is N/A for two-wheel diff (single axle)
+    # Included for compatibility with other profiles
+    wheelbase_m: 0.0
+
+    # Wheel radius in meters
+    wheel_radius_m: 0.2
+
+    # Maximum torque per wheel motor (Newton-meters)
+    # Higher torque = better traction and climbing ability
+    max_torque_nm: 150.0
+
+    # Wheel positions relative to rover center [x, y, z].
+    # ROS convention (+X fwd, +Y left, +Z up): left wheel at +Y, right at -Y.
+    # Wheels sit on a common lateral axle with the chassis centered above.
+    wheel_positions:
+      - [0.0, 0.3, 0.0]    # Left wheel  (+Y)
+      - [0.0, -0.3, 0.0]   # Right wheel (-Y)
+
+    # Drive characteristics
+    drive:
+      # Maximum wheel speed (rad/s)
+      max_wheel_speed_rads: 10.0
+
+      # Maximum forward speed (m/s) - derived from wheel speed and radius
+      max_forward_speed_ms: 3.0
+
+      # Motor type: direct_drive, geared, planetary
+      motor_type: geared
+
+      # Gear ratio (output speed / input speed)
+      gear_ratio: 5.0
+
+      # Motor efficiency (0.0-1.0)
+      motor_efficiency: 0.85
+
+    # Suspension and ground interaction
+    suspension:
+      # Suspension type: none, passive, semi-active, active
+      type: passive
+
+      # Spring stiffness (N/m) for passive suspension
+      spring_stiffness: 5000.0
+
+      # Damping coefficient (N·s/m)
+      damping_coefficient: 500.0
+
+    # Traction and grip
+    traction:
+      # Wheel material friction with terrain
+      friction_coefficient: 0.8
+
+      # Slip ratio tolerance (0.0-1.0)
+      # Controls traction control; higher = allow more slip
+      slip_tolerance: 0.1
+
+      # Adhesion coefficient (friction under normal load)
+      adhesion_coefficient: 0.7
+
+    # Mass and inertia
+    mass_kg: 20.0
+
+    # Moments of inertia [Ixx, Iyy, Izz] in kg·m²
+    # Compact chassis: small Ixx (roll), slightly larger Iyy/Izz (pitch/yaw).
+    inertia: [0.25, 0.5, 0.4]
+
+    # Center of mass offset from body origin [x, y, z].
+    # Modest lift above the axle — enough to make balance nontrivial without
+    # making the pendulum so top-heavy that the PD loop can't keep up.
+    com_offset: [0.0, 0.0, 0.1]
+
+    # Per-profile overrides (take precedence over the global `structure` block).
+    # Compact chassis: 0.3 m fore-aft, 0.4 m lateral, 0.4 m tall.
+    dimensions: [0.3, 0.4, 0.4]
+
+    # Arm base sits on top of the chassis, centered over the wheel axle.
+    arm_base_position: [0.0, 0.0, 0.2]
+
+
+  # ========================================================================
+  # PROFILE 2: THREE-WHEEL TRICYCLE
+  # ========================================================================
+  three_wheel_tricycle:
+    # Profile display name
+    name: "Three-Wheel Tricycle"
+
+    # Number of wheels on this rover
+    num_wheels: 3
+
+    # Track width (distance between left and right rear wheel centers) in meters
+    track_width_m: 0.9
+
+    # Wheelbase (distance from front wheel to rear axle) in meters
+    wheelbase_m: 1.2
+
+    # Wheel radius in meters
+    wheel_radius_m: 0.25
+
+    # Maximum torque per wheel motor (Newton-meters)
+    max_torque_nm: 100.0
+
+    # Wheel positions relative to rover center [x, y, z]
+    # Front steering wheel at origin (0, 0)
+    # Rear wheels on the axle
+    wheel_positions:
+      - [0.6, 0.0, 0.0]     # Front wheel (steerable)
+      - [-0.6, -0.45, 0.0]  # Left rear wheel (driven)
+      - [-0.6, 0.45, 0.0]   # Right rear wheel (driven)
+
+    # Drive characteristics
+    drive:
+      # Maximum wheel speed (rad/s)
+      max_wheel_speed_rads: 12.0
+
+      # Maximum forward speed (m/s)
+      max_forward_speed_ms: 3.0
+
+      # Motor type: direct_drive, geared, planetary
+      motor_type: geared
+
+      # Gear ratio
+      gear_ratio: 4.0
+
+      # Motor efficiency
+      motor_efficiency: 0.85
+
+    # Steering
+    steering:
+      # Steering motor torque (N·m)
+      max_steering_torque_nm: 50.0
+
+      # Maximum steering angle (degrees)
+      # Typical Ackermann steering: 30-45 degrees
+      max_steering_angle_degrees: 35.0
+
+      # Steering ratio (input angle / output angle)
+      steering_ratio: 1.5
+
+      # Steering response time (seconds to reach target angle)
+      response_time_s: 0.2
+
+    # Suspension and ground interaction
+    suspension:
+      # Suspension type
+      type: passive
+
+      # Spring stiffness for each wheel
+      spring_stiffness: 4000.0
+
+      # Damping coefficient
+      damping_coefficient: 400.0
+
+    # Traction and grip
+    traction:
+      # Wheel friction coefficient
+      friction_coefficient: 0.75
+
+      # Slip tolerance
+      slip_tolerance: 0.15
+
+      # Adhesion coefficient
+      adhesion_coefficient: 0.65
+
+    # Mass and inertia
+    mass_kg: 45.0
+
+    # Moments of inertia
+    inertia: [2.0, 4.0, 2.2]
+
+    # Center of mass offset
+    com_offset: [0.0, 0.0, -0.15]
+
+
+  # ========================================================================
+  # PROFILE 3: FOUR-WHEEL SKID STEER
+  # ========================================================================
+  four_wheel_skid:
+    # Profile display name
+    name: "Four-Wheel Skid Steer"
+
+    # Number of wheels on this rover
+    num_wheels: 4
+
+    # Track width (distance between left and right sides) in meters
+    track_width_m: 1.5
+
+    # Wheelbase (distance from front to rear axle) in meters
+    wheelbase_m: 1.8
+
+    # Wheel radius in meters
+    wheel_radius_m: 0.35
+
+    # Maximum torque per wheel motor (Newton-meters)
+    # Skid steer has independent motor for each wheel
+    max_torque_nm: 180.0
+
+    # Wheel positions relative to rover center [x, y, z]
+    wheel_positions:
+      - [0.9, -0.75, 0.0]   # Front left
+      - [0.9, 0.75, 0.0]    # Front right
+      - [-0.9, -0.75, 0.0]  # Rear left
+      - [-0.9, 0.75, 0.0]   # Rear right
+
+    # Drive characteristics
+    drive:
+      # Maximum wheel speed (rad/s)
+      max_wheel_speed_rads: 10.0
+
+      # Maximum forward speed (m/s)
+      max_forward_speed_ms: 2.5
+
+      # Motor type
+      motor_type: geared
+
+      # Gear ratio
+      gear_ratio: 6.0
+
+      # Motor efficiency
+      motor_efficiency: 0.85
+
+    # Skid steer specific parameters
+    skid_steer:
+      # Enable skid steer turning (differential wheel speeds)
+      enabled: true
+
+      # Turning agility factor
+      # Higher = tighter turning radius but more energy use
+      agility_factor: 1.0
+
+      # Slip compensation (adjust for terrain)
+      slip_compensation: 0.15
+
+    # Suspension and ground interaction
+    suspension:
+      # Suspension type: none, passive, semi-active
+      type: passive
+
+      # Spring stiffness (shared for all wheels)
+      spring_stiffness: 6000.0
+
+      # Damping coefficient
+      damping_coefficient: 600.0
+
+      # Suspension travel (maximum compression distance in meters)
+      travel_m: 0.1
+
+    # Traction and grip
+    traction:
+      # Wheel friction coefficient
+      friction_coefficient: 0.85
+
+      # Slip tolerance
+      slip_tolerance: 0.2
+
+      # Adhesion coefficient
+      adhesion_coefficient: 0.75
+
+    # Mass and inertia
+    mass_kg: 60.0
+
+    # Moments of inertia
+    inertia: [3.0, 6.0, 3.5]
+
+    # Center of mass offset
+    com_offset: [0.0, 0.0, -0.25]
+
+
+# ============================================================================
+# ROBOTIC ARM CONFIGURATION
+# ============================================================================
+
+arm:
+  # Arm presence and type
+  # Options: none, 2dof, 3dof, 4dof, 5dof, 6dof
+  type: 4dof
+
+  # Arm length parameters
+  # Degrees of freedom count
+  num_dof: 4
+
+  # Reach (maximum extension from base) in meters
+  reach_m: 2.0
+
+  # Link lengths (from base to end effector) in meters
+  link_lengths: [0.5, 0.5, 0.5, 0.5]
+
+  # Joint parameters
+  joints:
+    # Joint 1 (base rotation)
+    joint_1:
+      # Joint type: revolute, prismatic
+      type: revolute
+
+      # Axis of rotation [x, y, z]
+      axis: [0, 0, 1]
+
+      # Lower limit (radians)
+      lower_limit_rad: -3.14159
+
+      # Upper limit (radians)
+      upper_limit_rad: 3.14159
+
+      # Maximum angular velocity (rad/s)
+      max_velocity_rads: 2.0
+
+      # Maximum torque (N·m)
+      max_torque_nm: 100.0
+
+    # Joint 2 (shoulder)
+    joint_2:
+      type: revolute
+      axis: [0, 1, 0]
+      lower_limit_rad: -1.57079  # -90 degrees
+      upper_limit_rad: 1.57079   # +90 degrees
+      max_velocity_rads: 1.5
+      max_torque_nm: 80.0
+
+    # Joint 3 (elbow)
+    joint_3:
+      type: revolute
+      axis: [0, 1, 0]
+      lower_limit_rad: -1.57079
+      upper_limit_rad: 1.57079
+      max_velocity_rads: 1.5
+      max_torque_nm: 60.0
+
+    # Joint 4 (wrist)
+    joint_4:
+      type: revolute
+      axis: [0, 1, 0]
+      lower_limit_rad: -1.57079
+      upper_limit_rad: 1.57079
+      max_velocity_rads: 2.0
+      max_torque_nm: 40.0
+
+  # End effector (gripper)
+  gripper:
+    # Gripper type: none, parallel_jaw, soft_hand, magnetic
+    type: parallel_jaw
+
+    # Maximum grip force (Newtons)
+    max_grip_force_n: 500.0
+
+    # Gripper stroke (maximum opening distance in meters)
+    stroke_m: 0.1
+
+    # Gripper fingers length
+    finger_length_m: 0.1
+
+    # Gripper fingers width
+    finger_width_m: 0.03
+
+    # Minimum object size that can be gripped (meters)
+    min_grip_size_m: 0.01
+
+    # Maximum object size that can be gripped (meters)
+    max_grip_size_m: 0.1
+
+  # Arm payload capacity
+  # Maximum weight the gripper can hold (kg)
+  payload_kg: 5.0
+
+  # Arm base position relative to rover center [x, y, z]
+  base_position: [0.5, 0.0, 0.3]
+
+  # Arm inverse kinematics parameters
+  ik:
+    # Enable IK solver
+    enabled: true
+
+    # IK solver type: analytical, numerical, ccd
+    solver_type: numerical
+
+    # Maximum IK iterations
+    max_iterations: 100
+
+    # IK tolerance (meters)
+    position_tolerance_m: 0.01
+
+    # IK orientation tolerance (radians)
+    orientation_tolerance_rad: 0.1
+
+
+# ============================================================================
+# POWER SYSTEM CONFIGURATION
+# ============================================================================
+
+power:
+  # Solar panel configuration
+  solar:
+    # Number of solar panels
+    num_panels: 4
+
+    # Area per panel (m²)
+    area_per_panel_m2: 0.5
+
+    # Solar efficiency (0.0-1.0)
+    # Typical: 0.15-0.25 for terrestrial panels
+    efficiency: 0.20
+
+    # Maximum power output at lunar noon (Watts)
+    max_power_w: 400.0
+
+    # Panel orientation [roll, pitch, yaw] in degrees
+    # Optimized for Sun angle
+    orientation: [0.0, 0.0, 0.0]
+
+  # Battery configuration
+  battery:
+    # Battery type: lithium_ion, lithium_polymer, solid_state
+    type: lithium_ion
+
+    # Battery capacity (Watt-hours)
+    capacity_wh: 2000.0
+
+    # Current battery charge (Watt-hours)
+    current_charge_wh: 2000.0
+
+    # Battery voltage (Volts)
+    voltage_v: 48.0
+
+    # Maximum discharge rate (Amps)
+    max_discharge_a: 100.0
+
+    # Maximum charge rate (Amps)
+    max_charge_a: 50.0
+
+    # Battery efficiency (charge/discharge efficiency)
+    efficiency: 0.95
+
+    # Battery degradation rate per cycle
+    degradation_per_cycle: 0.001
+
+    # Minimum safe voltage (below this, operation restricted)
+    min_safe_voltage_v: 36.0
+
+    # Temperature-dependent capacity
+    temperature:
+      # Reference temperature (°C)
+      reference_temp_c: 25.0
+
+      # Capacity derating at -40°C (%/°C)
+      cold_derating_percent_per_c: 1.0
+
+      # Capacity derating at +60°C (%/°C)
+      hot_derating_percent_per_c: 0.5
+
+  # Power budget and distribution
+  power_budget:
+    # Priority-ordered power consumers with nominal power draw (Watts)
+    consumers:
+      mobility:
+        # Drive motor power consumption (Watts, typical)
+        power_w: 300.0
+        # Critical for mission (disable last)
+        critical: true
+
+      manipulator:
+        # Arm and gripper power consumption
+        power_w: 50.0
+        critical: false
+
+      lidar:
+        # Lidar sensor power
+        power_w: 10.0
+        critical: false
+
+      cameras:
+        # Camera sensors power
+        power_w: 15.0
+        critical: false
+
+      imu:
+        # IMU and other inertial sensors
+        power_w: 2.0
+        critical: false
+
+      compute:
+        # Main compute platform
+        power_w: 100.0
+        critical: true
+
+      communication:
+        # Radio/communication systems
+        power_w: 20.0
+        critical: false
+
+    # Total peak power (sum of all consumers)
+    # Used for power budget planning
+    total_peak_w: 497.0
+
+  # Charging parameters
+  charging:
+    # Charging time from 0-100% at base (hours)
+    full_charge_time_h: 4.0
+
+    # Minimum charge threshold for mission start (%)
+    min_charge_percent: 50.0
+
+    # Target charge for mission start (%)
+    target_charge_percent: 90.0
+
+
+# ============================================================================
+# ROVER STRUCTURE AND CHASSIS
+# ============================================================================
+
+structure:
+  # Chassis material: aluminum, carbon_fiber, titanium
+  chassis_material: aluminum
+
+  # Chassis dimensions [length, width, height] in meters
+  dimensions: [2.0, 1.5, 0.8]
+
+  # Clearance from ground to lowest component (meters)
+  ground_clearance_m: 0.15
+
+  # Approach angle (degrees)
+  # Maximum slope at front the rover can climb
+  approach_angle_deg: 45.0
+
+  # Departure angle (degrees)
+  # Maximum slope at rear the rover can descend
+  departure_angle_deg: 45.0
+
+  # Breakover angle (degrees)
+  # Maximum obstacle height and ditch width the rover can cross
+  breakover_angle_deg: 30.0
+
+  # Fording depth (maximum water/dust depth rover can traverse) in meters
+  # Moon: mainly dust depth
+  fording_depth_m: 0.5
+
+
+# ============================================================================
+# DEBUGGING AND LOGGING
+# ============================================================================
+
+debug:
+  # Enable rover debug visualization
+  enabled: false
+
+  # Show rover frame and axes
+  show_frame: false
+
+  # Show motor torques and speeds
+  show_motor_info: false
+
+  # Show sensor data overlay
+  show_sensors: false
+
+  # Log wheel slip ratio
+  log_slip_ratio: false
+
+  # Log power consumption
+  log_power: false

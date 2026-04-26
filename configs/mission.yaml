@@ -1,0 +1,466 @@
+# Moon Rover Mission Configuration
+# Per System 12 - Mission Grid, Deployment, and Success Criteria
+# This file defines the exploration grid layout, rover deployment strategy,
+# deployment cable parameters, and mission success criteria.
+
+# ============================================================================
+# MISSION METADATA
+# ============================================================================
+
+mission:
+  # Unique mission identifier
+  mission_id: lunar_exploration_001
+
+  # Mission name for logging and identification
+  mission_name: "Lunar Surface Exploration Grid"
+
+  # Mission description
+  description: "Multi-rover exploration mission with tethered deployment from moonbase station"
+
+  # Mission type: exploration, deployment, retrieval, communication_relay, sample_collection
+  mission_type: exploration
+
+  # Start time (simulation seconds from epoch)
+  # 0 = start immediately
+  start_time_s: 0.0
+
+  # Expected mission duration (seconds)
+  # Used for battery/power planning
+  duration_s: 3600.0
+
+
+# ============================================================================
+# EXPLORATION GRID CONFIGURATION
+# ============================================================================
+
+grid:
+  # Unique grid identifier
+  grid_id: grid_01
+
+  # Grid name
+  grid_name: "Main Survey Grid"
+
+  # Origin position of grid [x, y, z] in world coordinates (meters)
+  # This is where the grid coordinate (0,0) maps to in world space
+  origin: [50.0, 50.0, 0.0]
+
+  # Grid dimensions
+  # Number of rows (along y-axis in grid coordinates)
+  num_rows: 4
+
+  # Number of columns (along x-axis in grid coordinates)
+  num_cols: 5
+
+  # Cell spacing in meters
+  # Distance between adjacent grid points
+  spacing_m: 20.0
+
+  # Grid orientation (rotation around z-axis) in degrees
+  # 0 = aligned with world x-axis
+  orientation_degrees: 0.0
+
+  # Grid cell survey type
+  # Options: waypoint (visit single point), scan (sweep pattern), sample (collect data)
+  cell_type: waypoint
+
+  # Points per cell (for scan/sample missions)
+  # Higher = more detailed coverage but longer mission time
+  points_per_cell: 1
+
+  # Automatically generate waypoints for all grid cells
+  auto_generate_waypoints: true
+
+
+# ============================================================================
+# ROVER DEPLOYMENT CONFIGURATION
+# ============================================================================
+
+rovers:
+  # List of rovers to deploy in this mission
+
+  # Rover instance 1
+  - rover_id: rover_001
+    # Rover profile/type reference from rover.yaml
+    rover_profile: four_wheel_skid
+
+    # Rover name for logging
+    rover_name: "Scout-1"
+
+    # Deployment position (index in grid cell from origin)
+    # Relative grid coordinates where this rover deploys
+    grid_position: [0, 0]
+
+    # Tether/cable configuration for this rover
+    cable_id: cable_001
+
+    # Which grid cells are assigned to this rover
+    # Leave empty to auto-assign based on deployment strategy
+    assigned_cells: []
+
+    # Rover initial sensor mode
+    # Options: navigation, survey, detailed_scan
+    initial_sensor_mode: navigation
+
+  # Rover instance 2
+  - rover_id: rover_002
+    rover_profile: four_wheel_skid
+
+    rover_name: "Scout-2"
+
+    grid_position: [0, 2]
+
+    cable_id: cable_002
+
+    assigned_cells: []
+
+    initial_sensor_mode: navigation
+
+
+# ============================================================================
+# DEPLOYMENT STRATEGY
+# ============================================================================
+
+deployment:
+  # Deployment optimization strategy
+  # Options:
+  #   - greedy: deploy rovers sequentially in order
+  #   - parallel: deploy all rovers simultaneously
+  #   - distance_optimized: minimize total travel distance
+  #   - time_optimized: minimize total mission time
+  #   - coverage_optimized: maximize grid coverage
+  strategy: distance_optimized
+
+  # Deployment sequence (if using greedy or time-dependent strategies)
+  # List rover_ids in deployment order
+  deployment_order:
+    - rover_001
+    - rover_002
+
+  # Time between consecutive deployments (seconds)
+  # Used if deploying rovers sequentially
+  deployment_interval_s: 30.0
+
+  # Deployment direction preference
+  # Which grid direction to sweep: horizontal, vertical, spiral, random
+  sweep_direction: spiral
+
+  # Return to base after mission
+  return_to_base: true
+
+  # Station-keeping behavior at grid cells
+  # Time to spend at each waypoint (seconds)
+  dwell_time_s: 30.0
+
+
+# ============================================================================
+# DEPLOYMENT CABLE/TETHER CONFIGURATION
+# ============================================================================
+
+cable:
+  # Cable unique identifier
+  cable_id: cable_001
+
+  # Cable type: synthetic fiber, steel wire, umbilical
+  # synthetic_fiber: lightweight, good for long distances
+  # steel_wire: strong, for heavy loads, subject to kinking
+  # umbilical: bundles power, data, mechanical connection
+  cable_type: umbilical
+
+  # Cable length in meters
+  # Determines maximum deployment distance from moonbase
+  length_m: 60.0
+
+  # Cable diameter in millimeters
+  diameter_mm: 10.0
+
+  # Cable linear density (mass per unit length) in kg/m
+  linear_density_kg_m: 0.15
+
+  # Total cable mass in kg
+  # Calculated as: length_m * linear_density_kg_m
+  total_mass_kg: 9.0
+
+  # Cable breaking strength in Newtons
+  # Maximum tensile load before rupture
+  breaking_strength_n: 5000.0
+
+  # Working load limit (safe maximum) in Newtons
+  # Typically 10% of breaking strength for safety factor
+  max_tension_n: 500.0
+
+  # Cable elasticity
+  # Young's modulus (stiffness) in Pa (Pascals)
+  youngs_modulus_pa: 1.0e9
+
+  # Linear elasticity (fractional extension under load)
+  elasticity_coefficient: 0.001
+
+  # Cable drag coefficient (for tension calculations in wind/movement)
+  drag_coefficient: 1.2
+
+  # Power transmission through cable (if umbilical)
+  power:
+    # Enable power transmission through tether
+    enabled: true
+
+    # Power capacity (Watts)
+    power_capacity_w: 500.0
+
+    # Number of power conductors in cable
+    num_power_conductors: 2
+
+    # Conductor cross-section area (mm²)
+    conductor_area_mm2: 4.0
+
+    # Electrical resistance per unit length (Ohms/meter)
+    resistance_per_m_ohms: 0.005
+
+  # Data transmission through cable (if umbilical)
+  communication:
+    # Enable data transmission through tether
+    enabled: true
+
+    # Data rate (bits per second)
+    data_rate_bps: 1000000  # 1 Mbps
+
+    # Number of data conductors
+    num_data_conductors: 1
+
+    # Latency per meter of cable (milliseconds/meter)
+    latency_per_m_ms: 0.000005  # ~5 ns/meter (speed of light in copper)
+
+  # Mechanical properties under load
+  mechanics:
+    # Cable stretch limit (maximum safe elongation as fraction)
+    max_stretch_fraction: 0.02  # 2%
+
+    # Failure mode: break (snap), slip (through connector), kink
+    failure_mode: break
+
+    # Enable cable entanglement avoidance (for navigation planning)
+    avoid_entanglement: true
+
+
+# ============================================================================
+# WAYPOINT AND NAVIGATION CONFIGURATION
+# ============================================================================
+
+waypoints:
+  # List of waypoints for rover navigation (optional, can be auto-generated from grid)
+  # Format: each waypoint is [grid_x, grid_y, arrival_time_s]
+
+  # Automatically calculated waypoints from grid if this list is empty
+  auto_generate: true
+
+  # Waypoint spacing strategy
+  # Options: grid_corners, grid_centers, spiral, zigzag, custom
+  spacing_strategy: grid_centers
+
+  # Enforce navigation order
+  enforce_order: true
+
+  # Loitering behavior at waypoints
+  loiter:
+    # Enable loitering at waypoints
+    enabled: true
+
+    # Default loiter time (seconds)
+    default_time_s: 30.0
+
+    # Loiter radius (meters)
+    loiter_radius_m: 2.0
+
+
+# ============================================================================
+# SUCCESS CRITERIA AND MISSION GOALS
+# ============================================================================
+
+success_criteria:
+  # Primary success condition: all criteria must be met
+  # Options: all, any, weighted
+
+  criteria_logic: all
+
+  # Criteria list with weights and thresholds
+  criteria:
+    # Coverage criterion
+    - name: "Grid Coverage"
+      # Type: coverage, payload, connectivity, energy
+      type: coverage
+
+      # Minimum percentage of grid cells that must be surveyed
+      threshold_percent: 80.0
+
+      # Weight for success metric calculation (0.0-1.0)
+      weight: 0.3
+
+      # Is this criterion critical for mission success
+      critical: true
+
+    # Positioning accuracy criterion
+    - name: "Position Accuracy"
+      type: payload
+
+      # Maximum allowable position error at grid cells (meters)
+      threshold_m: 2.0
+
+      weight: 0.25
+
+      critical: true
+
+    # Tilt/stability criterion
+    - name: "Rover Stability"
+      type: payload
+
+      # Maximum allowable tilt angle (degrees)
+      threshold_degrees: 30.0
+
+      weight: 0.15
+
+      critical: false
+
+    # Cable tension criterion
+    - name: "Cable Integrity"
+      type: connectivity
+
+      # Maximum cable tension as fraction of breaking strength (0.0-1.0)
+      threshold_fraction: 0.5
+
+      weight: 0.15
+
+      critical: true
+
+    # Energy criterion
+    - name: "Energy Reserve"
+      type: energy
+
+      # Minimum battery charge at mission end (%)
+      threshold_percent: 10.0
+
+      weight: 0.15
+
+      critical: true
+
+  # Overall success score threshold (0.0-1.0)
+  # Mission considered successful if weighted score >= this value
+  success_score_threshold: 0.75
+
+
+# ============================================================================
+# CONTINGENCY AND FAILURE HANDLING
+# ============================================================================
+
+contingency:
+  # Enable contingency behaviors
+  enabled: true
+
+  # Actions to take if rover becomes immobilized
+  immobilization_timeout_s: 300.0  # 5 minutes
+
+  # Actions to take if cable tension exceeds threshold
+  cable_tension:
+    # Monitor cable tension
+    enabled: true
+
+    # Emergency cutoff tension (fraction of breaking strength)
+    cutoff_fraction: 0.8
+
+    # Action on tension exceeded: stop, reverse, alert, cut
+    action: alert
+
+  # Loss of communication recovery
+  communication_loss:
+    # Time before assuming communication lost (seconds)
+    timeout_s: 60.0
+
+    # Action on communication loss: stop, return_to_base, continue_autonomous
+    action: return_to_base
+
+  # Energy depletion handling
+  energy_depletion:
+    # Energy level to trigger contingency (%)
+    threshold_percent: 15.0
+
+    # Action on low energy: return_to_base, reduce_speed, shutdown_sensors
+    action: return_to_base
+
+  # Terrain collision handling
+  collision:
+    # Enable collision avoidance
+    enabled: true
+
+    # Action on imminent collision: stop, reverse, navigate_around
+    action: navigate_around
+
+
+# ============================================================================
+# MISSION ANALYSIS AND CONVERGENCE CRITERIA
+# ============================================================================
+
+analysis:
+  # Statistical analysis of mission performance
+
+  # Number of independent mission runs for statistical analysis
+  # Used to assess reliability and convergence
+  num_seeds: 30
+
+  # Convergence criteria
+  convergence:
+    # Enable convergence analysis
+    enabled: true
+
+    # Confidence interval for statistics (0.0-1.0)
+    # 0.95 = 95% confidence interval
+    confidence_interval: 0.95
+
+    # Convergence threshold for success metric variance
+    # Mission considered converged when std_dev <= threshold
+    threshold_std_dev: 0.05
+
+    # Minimum number of runs before checking convergence
+    min_runs: 10
+
+  # Performance metrics to collect
+  metrics:
+    - mission_completion_time_s
+    - grid_coverage_percent
+    - total_distance_traveled_m
+    - average_speed_ms
+    - energy_efficiency_m_per_wh
+    - cable_max_tension_n
+    - mean_position_error_m
+    - number_of_obstacles_avoided
+    - number_of_recovery_events
+
+
+# ============================================================================
+# LOGGING AND DEBUGGING
+# ============================================================================
+
+debug:
+  # Enable mission debug mode
+  enabled: false
+
+  # Log rover positions every N frames
+  position_log_interval: 10
+
+  # Log detailed trajectory data
+  log_trajectory: false
+
+  # Log sensor measurements
+  log_sensors: false
+
+  # Log cable tension and mechanical data
+  log_cable_data: false
+
+  # Log power consumption over time
+  log_power: false
+
+  # Log success metrics as mission progresses
+  log_success_metrics: true
+
+  # Save waypoint and grid visualization
+  save_grid_visualization: false
+
+  # Output directory for debug files
+  debug_output_dir: "./mission_logs/"

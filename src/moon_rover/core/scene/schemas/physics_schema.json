@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "physics.yaml schema",
+  "description": "Validates the top-level structure of physics.yaml for the Genesis physics engine.",
+  "type": "object",
+  "required": ["gravity", "timestep", "contact_solver"],
+  "additionalProperties": true,
+  "properties": {
+    "gravity": {
+      "type": "object",
+      "required": ["value"],
+      "properties": {
+        "value": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 3,
+          "maxItems": 3
+        }
+      }
+    },
+    "timestep": {
+      "type": "object",
+      "required": ["seconds"],
+      "properties": {
+        "seconds":      { "type": "number", "exclusiveMinimum": 0 },
+        "frequency_hz": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "substeps": {
+      "type": "object",
+      "properties": {
+        "count":    { "type": "integer", "minimum": 1 },
+        "adaptive": { "type": "boolean" }
+      }
+    },
+    "contact_solver": {
+      "type": "object",
+      "required": ["solver_iterations", "friction_model"],
+      "properties": {
+        "solver_iterations": { "type": "integer", "minimum": 1 },
+        "collision_margin":  { "type": "number", "minimum": 0 },
+        "friction_model":    { "type": "string", "minLength": 1 }
+      }
+    },
+    "broadphase": {
+      "type": "object",
+      "properties": {
+        "algorithm": { "type": "string", "minLength": 1 }
+      }
+    },
+    "gpu_backend": {
+      "type": "object",
+      "properties": {
+        "enabled":      { "type": "boolean" },
+        "cuda_version": { "type": "string" }
+      }
+    },
+    "determinism": {
+      "type": "object",
+      "properties": {
+        "random_seed": { "type": "integer" }
+      }
+    },
+    "performance": {
+      "type": "object",
+      "properties": {
+        "enable_sleeping":          { "type": "boolean" },
+        "sleep_velocity_threshold": { "type": "number", "minimum": 0 }
+      }
+    },
+    "damping": {
+      "type": "object",
+      "properties": {
+        "linear":  { "type": "number", "minimum": 0 },
+        "angular": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}

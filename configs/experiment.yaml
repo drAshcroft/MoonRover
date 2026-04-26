@@ -1,0 +1,469 @@
+# Moon Rover Experiment Configuration
+# Per System 14 - Experimental Design, Parameter Sweeps, and Analysis
+# This file defines example rover comparison experiments with variable parameters,
+# fixed conditions, success metrics, and convergence criteria for statistical analysis.
+
+# ============================================================================
+# EXPERIMENT METADATA
+# ============================================================================
+
+experiment:
+  # Unique experiment identifier
+  experiment_id: exp_001_drive_type_comparison
+
+  # Experiment name
+  name: "Drive Type Comparison Experiment"
+
+  # Detailed description of experiment goals and methodology
+  description: |
+    This experiment compares the performance of three rover drive configurations
+    (two-wheel differential, three-wheel tricycle, four-wheel skid steer) on
+    varied lunar terrain under standardized mission parameters. The goal is to
+    determine which drive type achieves optimal performance for exploration missions.
+
+  # Experiment type
+  # Options: comparison, optimization, sensitivity, robustness, benchmarking
+  experiment_type: comparison
+
+  # Principal investigator / researcher
+  principal_investigator: "Lunar Research Team"
+
+  # Creation date (ISO 8601 format)
+  creation_date: "2026-04-02"
+
+  # Expected execution time (hours)
+  expected_duration_h: 48.0
+
+
+# ============================================================================
+# EXPERIMENTAL DESIGN - VARIABLE PARAMETERS
+# ============================================================================
+
+variable_parameters:
+  # Primary independent variable: rover drive type
+  - parameter_name: "rover_profile"
+    # Parameter type: categorical, numerical, boolean
+    parameter_type: categorical
+
+    # Description of what this parameter represents
+    description: "Rover drive configuration and actuation type"
+
+    # Values to test (for categorical, list all options)
+    values:
+      - value: "two_wheel_diff"
+        display_name: "Two-Wheel Differential Drive"
+        weight: 1.0  # All values equally weighted in experiment
+
+      - value: "three_wheel_tricycle"
+        display_name: "Three-Wheel Tricycle"
+        weight: 1.0
+
+      - value: "four_wheel_skid"
+        display_name: "Four-Wheel Skid Steer"
+        weight: 1.0
+
+    # Reference to rover.yaml profiles
+    config_reference: "rover.yaml::profiles"
+
+  # Secondary independent variable: terrain type
+  - parameter_name: "terrain_seed"
+    # Numerical parameter with range
+    parameter_type: numerical
+
+    # Description
+    description: "Randomization seed for procedural terrain generation (determines unique terrain instance)"
+
+    # Numerical range specification
+    range:
+      # Minimum value (inclusive)
+      min: 1
+
+      # Maximum value (inclusive)
+      max: 30
+
+      # Step size (interval between test points)
+      step: 1
+
+    # Distribution strategy: linear, logarithmic, exponential, random
+    distribution: linear
+
+    # Number of seed values to sample
+    num_samples: 30
+
+    # Random seed for reproducible sampling
+    random_seed: 42
+
+    # Reference configuration
+    config_reference: "scene.yaml::terrain::seed"
+
+
+# ============================================================================
+# FIXED PARAMETERS (Held Constant Across Experiment)
+# ============================================================================
+
+fixed_parameters:
+  # Mission grid layout (same for all runs)
+  - parameter_name: "grid_layout"
+    value: "exploration_grid_01"
+    description: "4x5 exploration grid with 20m spacing"
+    config_reference: "mission.yaml::grid"
+
+  # Moonbase position (same for all runs)
+  - parameter_name: "moonbase_position"
+    value: [0.0, 0.0, 0.0]
+    description: "Moonbase station centered at world origin"
+    config_reference: "scene.yaml::moonbase::position"
+
+  # Sun elevation (same for all runs - consistent lighting)
+  - parameter_name: "sun_elevation"
+    value: 45.0
+    unit: "degrees"
+    description: "Sun at 45 degree elevation (consistent lighting throughout experiment)"
+    config_reference: "scene.yaml::sun::elevation_degrees"
+
+  # Physics timestep (same for all runs)
+  - parameter_name: "physics_timestep"
+    value: 0.004166
+    unit: "seconds"
+    description: "240 Hz simulation frequency for consistent physics integration"
+    config_reference: "physics.yaml::timestep::seconds"
+
+  # Sensor configuration (same for all runs)
+  - parameter_name: "sensor_suite"
+    value: "sensor_suite_001"
+    description: "Complete sensor suite for all rovers"
+    config_reference: "sensors.yaml::sensor_suite::suite_id"
+
+  # Mission type (same for all runs)
+  - parameter_name: "mission_type"
+    value: "exploration"
+    description: "Standard exploration mission grid coverage"
+    config_reference: "mission.yaml::mission::mission_type"
+
+  # Cable configuration (if applicable)
+  - parameter_name: "cable_length"
+    value: 60.0
+    unit: "meters"
+    description: "Deployment cable length for tethered rovers"
+    config_reference: "mission.yaml::cable::length_m"
+
+
+# ============================================================================
+# EXPERIMENT EXECUTION PLAN
+# ============================================================================
+
+execution:
+  # Total number of independent runs
+  # This is the product of all variable parameter combinations
+  # With 3 drive types × 30 terrain seeds = 90 runs
+  total_runs: 90
+
+  # Number of parallel execution threads
+  # How many simulations to run concurrently
+  # Limited by available computational resources
+  parallel_threads: 4
+
+  # Run scheduling strategy
+  # Options: sequential, parallel, adaptive
+  scheduling: parallel
+
+  # Random seed for run ordering (if randomized)
+  run_seed: 12345
+
+  # Execution timeout per run (minutes)
+  # Kills simulation if it exceeds this time
+  timeout_per_run_minutes: 30.0
+
+  # Resource limits per run
+  resources:
+    # Maximum GPU memory per run (GB)
+    max_gpu_memory_gb: 2.0
+
+    # Maximum CPU threads per run
+    max_cpu_threads: 2
+
+    # Maximum wall-clock time per run (seconds)
+    max_walltime_s: 1800
+
+
+# ============================================================================
+# SUCCESS METRICS AND KEY PERFORMANCE INDICATORS
+# ============================================================================
+
+success_metrics:
+  # List of metrics to calculate for each run
+
+  # Metric 1: Mission completion rate
+  - metric_name: "mission_completion_rate"
+    description: "Percentage of grid cells successfully surveyed"
+    unit: "percent"
+    # Calculation method: direct (from simulation), computed, aggregated
+    calculation_type: direct
+    # Target/threshold value for success
+    target_value: 80.0
+    # Whether this is a primary metric for comparison
+    primary_metric: true
+
+  # Metric 2: Total traversal distance
+  - metric_name: "total_distance_traveled"
+    description: "Cumulative distance rover traveled to complete mission"
+    unit: "meters"
+    calculation_type: direct
+    primary_metric: false
+
+  # Metric 3: Average traversal speed
+  - metric_name: "average_speed"
+    description: "Average rover velocity during mission"
+    unit: "m/s"
+    # Aggregation method: mean, median, min, max, std_dev
+    aggregation: mean
+    calculation_type: computed
+    primary_metric: false
+
+  # Metric 4: Energy efficiency
+  - metric_name: "energy_efficiency"
+    description: "Distance traveled per unit of battery consumed"
+    unit: "meters/Wh"
+    calculation_type: computed
+    aggregation: mean
+    primary_metric: true
+
+  # Metric 5: Mean position error at grid cells
+  - metric_name: "mean_position_error"
+    description: "Root mean square error of rover position at waypoints"
+    unit: "meters"
+    calculation_type: computed
+    aggregation: mean
+    target_value: 2.0
+    primary_metric: true
+
+  # Metric 6: Maximum cable tension
+  - metric_name: "max_cable_tension"
+    description: "Peak tensile load on deployment cable during mission"
+    unit: "Newtons"
+    calculation_type: direct
+    aggregation: max
+    primary_metric: false
+
+  # Metric 7: Number of terrain collision events
+  - metric_name: "collision_count"
+    description: "Number of collision avoidance maneuvers performed"
+    unit: "count"
+    calculation_type: direct
+    aggregation: sum
+    primary_metric: false
+
+  # Metric 8: Terrain traversability score
+  - metric_name: "traversability_score"
+    description: "Qualitative score of rover performance on terrain"
+    unit: "dimensionless (0-100)"
+    calculation_type: computed
+    aggregation: mean
+    primary_metric: true
+
+  # Metric 9: Turning radius (effective)
+  - metric_name: "turning_radius"
+    description: "Minimum turning radius achieved during mission"
+    unit: "meters"
+    calculation_type: computed
+    aggregation: min
+    primary_metric: false
+
+  # Metric 10: Stability score
+  - metric_name: "stability_score"
+    description: "Measure of rover platform stability (inverse of roll/pitch)"
+    unit: "dimensionless (0-1)"
+    calculation_type: computed
+    aggregation: mean
+    primary_metric: true
+
+
+# ============================================================================
+# STATISTICAL ANALYSIS AND CONVERGENCE CRITERIA
+# ============================================================================
+
+convergence:
+  # Enable convergence analysis during experiment execution
+  enabled: true
+
+  # Convergence criterion type
+  # Options: fixed_runs, variance_based, confidence_interval, custom
+  criterion: variance_based
+
+  # Number of independent runs before evaluating convergence
+  min_runs: 10
+
+  # Maximum number of runs before stopping (even if not converged)
+  max_runs: 30
+
+  # Confidence interval for statistical estimates
+  # 0.95 = 95% confidence interval
+  confidence_interval: 0.95
+
+  # Convergence threshold for metric variance
+  # Mission is converged when std_dev / mean <= this threshold
+  variance_threshold: 0.10  # 10% coefficient of variation
+
+  # Check convergence every N runs
+  check_interval: 5
+
+  # Required minimum runs per condition before accepting convergence
+  min_runs_per_condition: 5
+
+
+# ============================================================================
+# POST-EXECUTION ANALYSIS
+# ============================================================================
+
+analysis:
+  # Enable post-execution analysis
+  enabled: true
+
+  # Analysis modules to execute
+  modules:
+    # Statistical comparison of drive types
+    - module_type: statistical_comparison
+      description: "Compare performance metrics across drive types"
+      test_type: anova  # Analysis of Variance
+      alpha_level: 0.05  # Significance level
+
+    # Terrain dependency analysis
+    - module_type: terrain_sensitivity
+      description: "Analyze how performance varies with terrain difficulty"
+      method: linear_regression
+      analyze_parameter: terrain_seed
+
+    # Interaction effects analysis
+    - module_type: interaction_analysis
+      description: "Analyze interactions between rover type and terrain"
+      method: two_way_anova
+
+    # Visualization and plotting
+    - module_type: visualization
+      description: "Generate plots of performance metrics"
+      plot_types:
+        - box_plot  # Compare distributions
+        - line_plot  # Trend over terrain seeds
+        - heatmap   # Drive type vs terrain seed
+
+    # Report generation
+    - module_type: report_generation
+      description: "Generate experiment report"
+      format: pdf
+      include_sections:
+        - executive_summary
+        - methodology
+        - results
+        - discussion
+        - conclusions
+        - appendix
+
+
+# ============================================================================
+# OUTPUT AND LOGGING CONFIGURATION
+# ============================================================================
+
+output:
+  # Base output directory for all experiment results
+  output_directory: "./experiments/exp_001_results/"
+
+  # Subdirectory for each run
+  run_subdirectories: true
+
+  # Data format for saving results
+  # Options: hdf5, csv, json, rosbag
+  data_format: hdf5
+
+  # Compression method
+  compression: gzip
+
+  # Save raw simulation data
+  save_raw_data: true
+
+  # Save trajectory data for each run
+  save_trajectories: true
+
+  # Save sensor data logs
+  save_sensor_logs: false  # Set to true for detailed sensor analysis
+
+  # Save visualizations/videos
+  save_videos: false
+
+  # Video frame rate (fps)
+  video_fps: 30
+
+  # Log level: OFF, ERROR, WARNING, INFO, DEBUG
+  log_level: INFO
+
+  # Save configuration files used in experiment
+  save_configs: true
+
+  # Archive results when experiment completes
+  auto_archive: true
+
+  # Archive format: zip, tar, tar.gz
+  archive_format: tar.gz
+
+
+# ============================================================================
+# EXPERIMENT PARAMETERS SUMMARY
+# ============================================================================
+
+summary:
+  # Total experimental combinations
+  # 3 drive types × 30 terrain seeds = 90 unique configurations
+  total_combinations: 90
+
+  # Expected total computation time (hours)
+  # Estimate based on per-run time
+  estimated_computation_hours: 48.0
+
+  # Key comparison: Which drive type is most efficient?
+  primary_question: "Which rover drive configuration achieves optimal exploration efficiency?"
+
+  # Secondary questions
+  secondary_questions:
+    - "How does terrain difficulty affect each drive type?"
+    - "What is the energy efficiency ranking of drive types?"
+    - "Which drive type shows best stability on lunar terrain?"
+    - "How scalable are results across different terrain seeds?"
+
+  # Expected outcomes
+  expected_outcomes:
+    - "Quantified performance metrics for each drive type"
+    - "Statistical significance of performance differences"
+    - "Recommended drive configuration for lunar exploration"
+    - "Terrain-dependent performance profiles"
+    - "Energy efficiency estimates for mission planning"
+
+
+# ============================================================================
+# DEBUGGING AND DIAGNOSTIC OPTIONS
+# ============================================================================
+
+debug:
+  # Enable debug mode (verbose logging, extra data collection)
+  enabled: false
+
+  # Run single test configuration for debugging
+  debug_single_run: false
+
+  # Debug configuration (if running single test)
+  debug_config:
+    rover_profile: "four_wheel_skid"
+    terrain_seed: 12345
+
+  # Save detailed frame-by-frame physics state
+  save_physics_states: false
+
+  # Save sensor raw data for each frame
+  save_raw_sensor_data: false
+
+  # Enable interactive debugging (pause between runs)
+  interactive_mode: false
+
+  # Visualization during runs
+  show_visualization: false
+
+  # Profile execution (measure wall-clock time for each component)
+  profile_execution: false

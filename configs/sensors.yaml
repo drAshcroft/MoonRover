@@ -1,0 +1,709 @@
+# Moon Rover Sensor Configuration
+# Per System 7 - Sensor Suite, Data Acquisition, and Real-Time Processing
+# This file defines all sensor parameters including Lidar, stereo cameras,
+# IMU, GPS beacon, force-torque sensing, and sun sensors.
+
+# ============================================================================
+# SENSOR SUITE METADATA
+# ============================================================================
+
+sensor_suite:
+  # Unique sensor configuration identifier
+  suite_id: sensor_suite_001
+
+  # Configuration name
+  name: "Primary Moon Rover Sensor Suite"
+
+  # Description
+  description: "Comprehensive sensing package for lunar surface exploration and manipulation"
+
+  # Total sensor power consumption (Watts)
+  # Used for power budgeting
+  total_power_w: 27.0
+
+
+# ============================================================================
+# LIDAR SENSOR - VELODYNE VLP-32C
+# ============================================================================
+
+lidar:
+  # Sensor enabled flag
+  enabled: true
+
+  # Sensor name and model
+  model: "Velodyne VLP-32C"
+
+  # Unique sensor identifier
+  sensor_id: lidar_001
+
+  # Mounting position relative to rover [x, y, z] in meters
+  mount_position: [0.5, 0.0, 0.5]
+
+  # Mounting orientation [roll, pitch, yaw] in degrees
+  mount_orientation: [0.0, 0.0, 0.0]
+
+  # Power consumption (Watts)
+  power_w: 8.0
+
+  # Update frequency (Hz)
+  frequency_hz: 10.0
+
+  # Number of laser channels
+  num_channels: 32
+
+  # Field of view parameters
+  fov:
+    # Horizontal FOV (degrees)
+    # VLP-32C: 360 degrees
+    horizontal_deg: 360.0
+
+    # Vertical FOV (degrees)
+    # VLP-32C: -25.33 to +15.67 degrees
+    vertical_lower_deg: -25.33
+    vertical_upper_deg: 15.67
+
+  # Range parameters
+  range:
+    # Minimum detection range (meters)
+    min_range_m: 0.5
+
+    # Maximum detection range (meters)
+    # VLP-32C: typical 100m, extended up to 130m
+    max_range_m: 100.0
+
+    # Range resolution (millimeters)
+    range_resolution_mm: 20.0
+
+  # Accuracy specifications
+  accuracy:
+    # Range accuracy (±mm)
+    # VLP-32C: ±30mm
+    range_accuracy_mm: 30.0
+
+    # Angular resolution (degrees)
+    # VLP-32C: 0.2 degrees
+    angular_resolution_deg: 0.2
+
+  # Point cloud parameters
+  points:
+    # Maximum points per scan
+    max_points_per_scan: 102400
+
+    # Point cloud format: xyz, xyzi, xyzrgb
+    format: xyzi
+
+    # Intensity values provided by sensor
+    provides_intensity: true
+
+    # Return mode: single, dual, triple
+    # Number of returns per pulse
+    return_mode: dual
+
+  # Noise model
+  noise:
+    # Add Gaussian noise to range measurements
+    enable_noise: true
+
+    # Range noise standard deviation (meters)
+    range_noise_std_m: 0.02
+
+    # Angular noise standard deviation (degrees)
+    angular_noise_std_deg: 0.01
+
+  # Sensor degradation effects
+  degradation:
+    # Simulate dust/contamination accumulation
+    enable_dust_accumulation: true
+
+    # Dust affects range accuracy (%)
+    dust_range_degradation_percent: 5.0
+
+    # Dust affects intensity measurements (%)
+    dust_intensity_degradation_percent: 10.0
+
+  # Output configuration
+  output:
+    # Publish point cloud data
+    publish_pointcloud: true
+
+    # Publish intensity image
+    publish_intensity: false
+
+    # Publish range image
+    publish_range_image: false
+
+    # Data rate (points/sec or Hz)
+    data_rate_hz: 10.0
+
+
+# ============================================================================
+# STEREO CAMERA PAIR - FRONT
+# ============================================================================
+
+stereo_camera_front:
+  # Sensor enabled flag
+  enabled: true
+
+  # Sensor name
+  name: "Front Stereo Camera"
+
+  # Unique sensor identifier
+  sensor_id: stereo_front_001
+
+  # Mounting position relative to rover [x, y, z] in meters
+  mount_position: [1.0, 0.0, 0.3]
+
+  # Mounting orientation [roll, pitch, yaw] in degrees
+  mount_orientation: [0.0, 0.0, 0.0]
+
+  # Power consumption (Watts)
+  power_w: 3.0
+
+  # Update frequency (Hz)
+  frequency_hz: 30.0
+
+  # Stereo baseline (distance between left and right cameras) in meters
+  baseline_m: 0.12
+
+  # Camera parameters (left and right cameras)
+  camera:
+    # Image resolution [width, height] in pixels
+    resolution: [640, 480]
+
+    # Focal length in pixels
+    focal_length_px: 320.0
+
+    # Principal point (optical center) [cx, cy] in pixels
+    principal_point: [320.0, 240.0]
+
+    # Field of view (diagonal) in degrees
+    fov_deg: 60.0
+
+    # Lens distortion parameters
+    distortion:
+      # Radial distortion coefficients
+      k1: -0.1
+      k2: 0.05
+      # Tangential distortion coefficients
+      p1: 0.0
+      p2: 0.0
+
+    # Sensor noise
+    noise:
+      # Gaussian noise on image intensity
+      intensity_noise_std: 2.0  # pixel values 0-255
+
+      # Quantization noise (bit depth)
+      bit_depth: 8
+
+  # Stereo processing parameters
+  stereo:
+    # Disparity computation method
+    # Options: sad, ssd, census, sgbm
+    matching_method: sgbm
+
+    # Disparity search range (pixels)
+    disparity_range: 64
+
+    # Minimum confidence for disparity estimate
+    min_disparity_confidence: 0.7
+
+    # Post-processing filters
+    post_filter:
+      enabled: true
+      type: median  # median, morphological
+      kernel_size: 3
+
+  # Depth range from stereo
+  depth:
+    # Minimum depth (meters)
+    min_depth_m: 0.5
+
+    # Maximum depth (meters)
+    max_depth_m: 15.0
+
+    # Depth estimation uncertainty (meters per meter of distance)
+    depth_uncertainty_ratio: 0.02
+
+  # Output configuration
+  output:
+    # Publish left image
+    publish_left_image: true
+
+    # Publish right image
+    publish_right_image: false
+
+    # Publish disparity map
+    publish_disparity: false
+
+    # Publish depth map
+    publish_depth: true
+
+    # Publish point cloud from stereo
+    publish_pointcloud: false
+
+
+# ============================================================================
+# NAVIGATION CAMERA - WIDE ANGLE HAZARD CAMERA PAIR
+# ============================================================================
+
+navcam:
+  # Sensor enabled flag
+  enabled: true
+
+  # Sensor name
+  name: "Navigation Camera Pair (Hazard Cameras)"
+
+  # Unique sensor identifier
+  sensor_id: navcam_001
+
+  # Mounting position relative to rover [x, y, z] in meters
+  # Typically mounted on sides/rear for obstacle detection
+  mount_position: [0.5, 0.5, 0.4]
+
+  # Mounting orientation [roll, pitch, yaw] in degrees
+  mount_orientation: [0.0, 0.0, 90.0]  # Facing sideways
+
+  # Power consumption (Watts)
+  power_w: 2.0
+
+  # Update frequency (Hz)
+  frequency_hz: 10.0
+
+  # Camera parameters
+  camera:
+    # Image resolution [width, height] in pixels
+    resolution: [320, 240]
+
+    # Focal length in pixels
+    focal_length_px: 240.0
+
+    # Principal point [cx, cy] in pixels
+    principal_point: [160.0, 120.0]
+
+    # Field of view (diagonal) in degrees
+    # Wide angle for hazard detection
+    fov_deg: 120.0
+
+    # Lens distortion (wide angle = significant distortion)
+    distortion:
+      k1: -0.2
+      k2: 0.1
+      p1: 0.0
+      p2: 0.0
+
+    # Sensor noise
+    noise:
+      intensity_noise_std: 3.0
+
+      bit_depth: 8
+
+  # Output configuration
+  output:
+    # Publish image
+    publish_image: true
+
+    # Data rate (Hz)
+    data_rate_hz: 10.0
+
+
+# ============================================================================
+# INERTIAL MEASUREMENT UNIT (IMU)
+# ============================================================================
+
+imu:
+  # Sensor enabled flag
+  enabled: true
+
+  # Sensor name
+  name: "Inertial Measurement Unit"
+
+  # Unique sensor identifier
+  sensor_id: imu_001
+
+  # Mounting position relative to rover center of mass [x, y, z]
+  mount_position: [0.0, 0.0, 0.0]
+
+  # Power consumption (Watts)
+  power_w: 0.5
+
+  # Update frequency (Hz)
+  frequency_hz: 100.0
+
+  # Accelerometer specifications
+  accelerometer:
+    # Measurement axes: 3-axis (x, y, z)
+    axes: 3
+
+    # Full scale measurement range (±g, where g = 9.81 m/s²)
+    full_scale_g: 16.0
+
+    # Maximum measurement in m/s²
+    full_scale_ms2: 156.96
+
+    # Sensitivity (LSB per g)
+    sensitivity_lsb_per_g: 2048.0
+
+    # Resolution in m/s² per LSB
+    resolution_ms2_per_lsb: 0.0048
+
+    # Noise characteristics
+    noise:
+      # Bias stability (m/s²)
+      bias_stability_ms2: 0.05
+
+      # Angle random walk (°/√hr)
+      angle_random_walk_deg_sqrt_hr: 2.0
+
+      # Noise spectral density (m/s²/√Hz)
+      noise_density_ms2_sqrt_hz: 0.005
+
+      # Bias (constant offset) in m/s²
+      bias_m: 0.1
+
+      # Bias stability over time
+      bias_instability_m: 0.01
+
+  # Gyroscope specifications
+  gyroscope:
+    # Measurement axes
+    axes: 3
+
+    # Full scale measurement range (°/s)
+    full_scale_deg_s: 250.0
+
+    # Full scale in rad/s
+    full_scale_rad_s: 4.363
+
+    # Sensitivity (LSB per °/s)
+    sensitivity_lsb_per_deg_s: 131.0
+
+    # Resolution in rad/s per LSB
+    resolution_rad_s_per_lsb: 0.000266
+
+    # Noise characteristics
+    noise:
+      # Bias stability (°/s)
+      bias_stability_deg_s: 2.0
+
+      # Angle random walk (°/√hr)
+      angle_random_walk_deg_sqrt_hr: 0.2
+
+      # Noise spectral density (°/s/√Hz)
+      noise_density_deg_s_sqrt_hz: 0.02
+
+      # Bias (constant offset) in °/s
+      bias_deg_s: 1.0
+
+      # Bias instability
+      bias_instability_deg_s: 0.1
+
+  # Magnetometer (for heading reference)
+  magnetometer:
+    # Sensor enabled
+    enabled: true
+
+    # Measurement axes
+    axes: 3
+
+    # Full scale range (Gauss)
+    full_scale_gauss: 4.7
+
+    # Sensitivity (LSB per Gauss)
+    sensitivity_lsb_per_gauss: 660.0
+
+    # Noise spectral density (mG/√Hz)
+    noise_density_mg_sqrt_hz: 0.3
+
+  # Temperature sensor (optional)
+  temperature:
+    # Temperature measurement enabled
+    enabled: true
+
+    # Temperature measurement range (°C)
+    range_min_c: -40.0
+    range_max_c: 85.0
+
+    # Temperature sensitivity (LSB/°C)
+    sensitivity_lsb_per_c: 340.0
+
+    # Temperature resolution (°C)
+    resolution_c: 0.003
+
+
+# ============================================================================
+# GPS BEACON RECEIVER
+# ============================================================================
+
+gps_beacon:
+  # Sensor enabled flag
+  enabled: true
+
+  # Sensor name
+  name: "GPS Beacon Receiver"
+
+  # Unique sensor identifier
+  sensor_id: gps_beacon_001
+
+  # Mounting position relative to rover [x, y, z] in meters
+  # Typically on top of rover for line-of-sight to moonbase
+  mount_position: [0.0, 0.0, 0.6]
+
+  # Power consumption (Watts)
+  power_w: 0.5
+
+  # Update frequency (Hz)
+  frequency_hz: 1.0
+
+  # Beacon receiver specifications
+  receiver:
+    # Receiver sensitivity (dBm)
+    sensitivity_dbm: -130.0
+
+    # Acquisition time (seconds)
+    acquisition_time_s: 30.0
+
+    # Tracking mode: tracking, acquiring, lost
+    default_mode: acquiring
+
+  # Positioning accuracy
+  accuracy:
+    # Horizontal position accuracy (meters)
+    # Depends on signal quality and multipath
+    horizontal_accuracy_m: 1.0
+
+    # Vertical position accuracy (meters)
+    vertical_accuracy_m: 2.0
+
+    # Accuracy varies with signal strength
+    min_signal_strength: -110.0  # dBm
+
+    # Optimal signal strength
+    optimal_signal_strength: -100.0  # dBm
+
+  # Range from moonbase
+  range:
+    # Maximum line-of-sight range (meters)
+    max_range_m: 1000.0
+
+    # Optimal range (meters)
+    optimal_range_m: 500.0
+
+  # Beacon configuration
+  beacon:
+    # Beacon frequency (MHz)
+    frequency_mhz: 400.0
+
+    # Beacon transmission power (dBm)
+    transmit_power_dbm: 20.0
+
+    # Beacon modulation type
+    modulation: bpsk
+
+    # Beacon data rate (bps)
+    data_rate_bps: 1000
+
+
+# ============================================================================
+# FORCE-TORQUE SENSOR (End Effector/Gripper)
+# ============================================================================
+
+force_torque_sensor:
+  # Sensor enabled flag
+  enabled: true
+
+  # Sensor name
+  name: "Force-Torque Sensor"
+
+  # Unique sensor identifier
+  sensor_id: ft_sensor_001
+
+  # Mounting position (at gripper/end effector)
+  # Relative to arm base
+  mount_position: [2.0, 0.0, 0.3]
+
+  # Power consumption (Watts)
+  power_w: 0.5
+
+  # Update frequency (Hz)
+  frequency_hz: 50.0
+
+  # Force measurement specifications
+  force:
+    # Measurement axes
+    axes: 3  # Fx, Fy, Fz
+
+    # Full scale measurement range (Newtons)
+    full_scale_n: 500.0
+
+    # Force resolution (Newton)
+    resolution_n: 0.1
+
+    # Force accuracy (% of full scale)
+    accuracy_percent: 1.0
+
+    # Force noise spectral density (N/√Hz)
+    noise_density_n_sqrt_hz: 0.05
+
+  # Torque measurement specifications
+  torque:
+    # Measurement axes
+    axes: 3  # Mx, My, Mz
+
+    # Full scale measurement range (Newton-meters)
+    full_scale_nm: 50.0
+
+    # Torque resolution (Newton-meter)
+    resolution_nm: 0.01
+
+    # Torque accuracy (% of full scale)
+    accuracy_percent: 1.0
+
+    # Torque noise spectral density (N·m/√Hz)
+    noise_density_nm_sqrt_hz: 0.005
+
+  # Sensor calibration
+  calibration:
+    # Calibration date (for reference)
+    calibration_date: "2026-01-01"
+
+    # Calibration matrix (6x6 for F/T coupling)
+    # Applied to raw measurements for decoupling
+    decoupling_enabled: true
+
+
+# ============================================================================
+# SUN SENSOR (Solar Incidence Angle Measurement)
+# ============================================================================
+
+sun_sensor:
+  # Sensor enabled flag
+  enabled: true
+
+  # Sensor name
+  name: "Sun Sensor"
+
+  # Unique sensor identifier
+  sensor_id: sun_sensor_001
+
+  # Mounting position on rover [x, y, z]
+  # Typically on top for optimal sun exposure measurement
+  mount_position: [0.0, 0.0, 0.8]
+
+  # Power consumption (Watts)
+  power_w: 0.2
+
+  # Update frequency (Hz)
+  frequency_hz: 1.0
+
+  # Sensor specifications
+  sensor:
+    # Sensor type: photodiode, coarse_sun_sensor, fine_sun_sensor
+    type: coarse_sun_sensor
+
+    # Field of view (degrees)
+    # Coarse sun sensor typically has wide FOV
+    fov_deg: 60.0
+
+    # Measurement axes (2D sun direction)
+    axes: 2
+
+    # Angular resolution (degrees)
+    angular_resolution_deg: 1.0
+
+    # Sun direction accuracy (degrees)
+    accuracy_deg: 0.5
+
+    # Sun detection threshold (solar altitude angle in degrees)
+    # Below this angle, sun is not detected (e.g., night)
+    detection_threshold_deg: -5.0
+
+  # Output
+  output:
+    # Sun vector (pointing toward sun)
+    provides_sun_vector: true
+
+    # Sun incidence angle (angle from sensor normal)
+    provides_incidence_angle: true
+
+    # Sun elevation and azimuth
+    provides_elevation_azimuth: true
+
+
+# ============================================================================
+# SENSOR FUSION AND PROCESSING
+# ============================================================================
+
+sensor_fusion:
+  # Enable sensor fusion algorithms
+  enabled: true
+
+  # Fusion method: ekf (Extended Kalman Filter), ukf (Unscented Kalman Filter)
+  fusion_method: ekf
+
+  # Primary localization source
+  # Options: gps_beacon, imu_dead_reckoning, lidar_matching, stereo_slam
+  primary_source: gps_beacon
+
+  # Secondary localization source
+  secondary_source: lidar_matching
+
+  # Fusion update frequency (Hz)
+  fusion_frequency_hz: 50.0
+
+  # Process noise covariance
+  process_noise:
+    position_noise_m2: 0.1
+    velocity_noise_ms2: 0.01
+    orientation_noise_rad2: 0.01
+
+  # Measurement noise covariance
+  measurement_noise:
+    gps_position_noise_m2: 1.0
+    imu_acceleration_noise_ms2: 0.1
+    imu_angular_velocity_noise_rad2: 0.01
+
+
+# ============================================================================
+# SENSOR DATA RECORDING AND LOGGING
+# ============================================================================
+
+recording:
+  # Enable sensor data recording
+  enabled: true
+
+  # Recording output format: rosbag, hdf5, csv
+  format: hdf5
+
+  # Record all sensor streams
+  record_all: true
+
+  # Compression: none, gzip, lz4
+  compression: gzip
+
+  # Output directory for sensor data
+  output_directory: "./sensor_logs/"
+
+
+# ============================================================================
+# DEBUGGING AND DIAGNOSTICS
+# ============================================================================
+
+debug:
+  # Enable sensor debug mode
+  enabled: false
+
+  # Log sensor diagnostics
+  log_diagnostics: false
+
+  # Diagnostic publish frequency (Hz)
+  diagnostic_frequency_hz: 1.0
+
+  # Simulate sensor failures for testing
+  simulate_failures: false
+
+  # Show sensor visualizations in viewer
+  visualization_enabled: false
+
+  # Sensor visualization scale (for point clouds, etc.)
+  visualization_scale: 1.0

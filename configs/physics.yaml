@@ -1,0 +1,235 @@
+# Genesis Physics Engine Configuration
+# Per System 1 - Physics Simulation Parameters
+# This file defines all physics parameters for the Moon Rover simulation environment
+# using the Genesis physics engine with GPU acceleration.
+
+# ============================================================================
+# GRAVITY PARAMETERS
+# ============================================================================
+
+gravity:
+  # Lunar gravity vector [x, y, z] in m/s²
+  # Earth gravity is [0, 0, -9.81]; Moon is approximately 1/6th of Earth
+  # This represents approximately 1.622 m/s² downward (negative z-direction)
+  value: [0, 0, -1.622]
+
+
+# ============================================================================
+# SIMULATION TIMESTEP AND INTEGRATION
+# ============================================================================
+
+timestep:
+  # Simulation timestep in seconds
+  # 0.004166 seconds = 1/240 Hz = 4.166 milliseconds
+  # This is the duration of each integration step; smaller values increase accuracy but reduce performance
+  seconds: 0.004166
+
+  # Physics update frequency in Hz
+  # Should be the inverse of timestep: 1 / 0.004166 = 240 Hz
+  frequency_hz: 240
+
+substeps:
+  # Number of sub-integration steps per main timestep
+  # Increases numerical stability when solving contacts and constraints
+  # Higher values are more stable but computationally expensive
+  # 2 gives good stability for rover wheel-terrain contact at 240 Hz
+  # Raise to 4 only for MPM-heavy scenes or extreme contact complexity
+  count: 2
+
+  # Enable adaptive substep count (auto-adjust based on contact complexity)
+  adaptive: false
+
+
+# ============================================================================
+# COLLISION DETECTION AND RESPONSE
+# ============================================================================
+
+contact_solver:
+  # Maximum number of iterations for the contact solver
+  # Higher values increase contact accuracy at computational cost
+  # 15 is well-converged for rigid body rover dynamics
+  # Raise to 30+ only for MPM or extremely stiff contacts
+  solver_iterations: 15
+
+  # Collision margin in meters (penetration tolerance)
+  # Smaller values increase accuracy but may cause instability
+  # Typical range: 0.001-0.005 meters
+  collision_margin: 0.002
+
+  # Friction model selection
+  # Options: coulomb_isotropic, coulomb_anisotropic, box_friction
+  # coulomb_anisotropic allows different friction in different directions
+  friction_model: coulomb_anisotropic
+
+
+# ============================================================================
+# BROADPHASE COLLISION DETECTION
+# ============================================================================
+
+broadphase:
+  # Broadphase algorithm for collision detection
+  # Options:
+  #   - sap: Sweep and Prune (good for dynamic scenes, fewer broad collisions)
+  #   - bvh: Bounding Volume Hierarchy (better for static/large terrains)
+  #   - uniform_grid: Simple uniform grid (good for dense, regular scenes)
+  algorithm: sap
+
+  # Number of broadphase iterations per timestep
+  # Typically 1 is sufficient unless using adaptive collision scheduling
+  iterations: 1
+
+
+# ============================================================================
+# GPU ACCELERATION
+# ============================================================================
+
+gpu_backend:
+  # Enable GPU acceleration for physics simulation
+  # Significantly speeds up large-scale simulations with many bodies
+  # Requires compatible NVIDIA GPU and CUDA installation
+  enabled: true
+
+  # Minimum CUDA Compute Capability version required
+  # Format: "major.minor" (e.g., "11.8")
+  # Genesis requires CUDA 11.0+ for GPU physics
+  cuda_min_version: "11.8"
+
+  # GPU device ID to use (if multiple GPUs available)
+  # Set to 0 for first GPU, 1 for second, etc.
+  device_id: 0
+
+  # Enable GPU memory optimization (reduces memory footprint)
+  memory_optimization: true
+
+  # Maximum GPU memory to allocate for physics (in GB)
+  # Set to 0 for unlimited (uses available GPU memory)
+  max_memory_gb: 0
+
+
+# ============================================================================
+# DETERMINISM AND SERIALIZATION
+# ============================================================================
+
+determinism:
+  # Enable deterministic mode for reproducible simulations
+  # When enabled, same input conditions will produce identical results
+  # Disabling may provide minor performance improvements
+  deterministic_serialization: true
+
+  # Random seed for initial conditions (for reproducibility)
+  # Set to same value to get identical simulation runs
+  # Set to -1 to use random seed each run
+  random_seed: 42
+
+  # Enable floating-point determinism (slower, but bit-identical results)
+  # Only relevant if deterministic_serialization is true
+  strict_floating_point: true
+
+
+# ============================================================================
+# MATERIAL AND SOLVER CONFIGURATION
+# ============================================================================
+
+solver_map:
+  # Mapping of material types to solver types
+  # Defines which physics solver to use for each material/body type
+  # This allows mixed simulation with different material models in one scene
+
+  # Rigid body solver: Traditional rigid body dynamics (fast, stable)
+  rigid_body: rigid_body_solver
+
+  # Material Point Method: Good for deformable materials, sand, snow
+  mpm: material_point_method_solver
+
+  # Smoothed Particle Hydrodynamics: For fluids, granular materials
+  sph: sph_solver
+
+  # Finite Element Method: For elastic deformation, structural analysis
+  fem: finite_element_solver
+
+  # Position-Based Dynamics: For cloth, ropes, soft bodies
+  pbd: position_based_dynamics_solver
+
+
+# ============================================================================
+# CONSTRAINT SOLVING
+# ============================================================================
+
+constraint_solver:
+  # Enable warm-starting (use previous solution as initial guess)
+  # Improves convergence speed and stability
+  warm_start: true
+
+  # Constraint force mixing (adds small amount of spring-like behavior)
+  # Range: 0.0-1.0; higher values are more soft/springy
+  cfm: 0.00001
+
+  # Error reduction parameter (how aggressively to correct penetration)
+  # Range: 0.0-1.0; higher values correct faster but may oscillate
+  erp: 0.2
+
+
+# ============================================================================
+# DAMPING AND ENERGY DISSIPATION
+# ============================================================================
+
+damping:
+  # Linear damping coefficient (simulates air resistance)
+  # Applied to linear velocity; higher values increase drag
+  linear: 0.04
+
+  # Angular damping coefficient (simulates rotational air resistance)
+  # Applied to angular velocity
+  angular: 0.04
+
+  # Enable material-specific damping overrides
+  material_specific: false
+
+
+# ============================================================================
+# PERFORMANCE AND OPTIMIZATION
+# ============================================================================
+
+performance:
+  # Maximum number of contact points per body pair
+  # Limits memory usage and contact solver iterations
+  max_contacts_per_pair: 4
+
+  # Enable sleeping (deactivate inactive bodies)
+  # Significantly improves performance for scenes with many static/slow bodies
+  enable_sleeping: true
+
+  # Velocity threshold for sleep activation (m/s)
+  sleep_velocity_threshold: 0.01
+
+  # Time before body can sleep (seconds)
+  sleep_threshold_time: 0.5
+
+  # Enable contact caching (reuse contact points from previous frame)
+  contact_caching: true
+
+  # Enable multi-threaded simulation
+  multi_threaded: true
+
+  # Number of CPU threads to use (0 = auto-detect)
+  num_threads: 0
+
+
+# ============================================================================
+# DEBUGGING AND LOGGING
+# ============================================================================
+
+debug:
+  # Enable physics debug visualization
+  # Shows contact points, normals, forces in the visualization window
+  visualization_enabled: false
+
+  # Log level for physics engine
+  # Options: OFF, ERROR, WARNING, INFO, DEBUG, TRACE
+  log_level: WARNING
+
+  # Enable profiling of physics simulation time
+  enable_profiling: false
+
+  # Report statistics every N frames (0 = no reporting)
+  statistics_interval: 0

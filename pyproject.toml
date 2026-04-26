@@ -1,0 +1,111 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moon-rover"
+version = "0.1.0"
+description = "Professional-grade lunar surface simulation for moonbase antenna grid deployment using the Genesis physics engine"
+readme = "README_STUBS.md"
+requires-python = ">=3.10"
+license = {text = "Proprietary"}
+
+# ──────────────────────────────────────────────
+# CORE DEPENDENCIES
+# Genesis must be installed separately — see docs/INSTALL.md
+# GPU dependencies (CUDA 11.8+) required for MPM/SPH solvers
+# ──────────────────────────────────────────────
+dependencies = [
+    # "genesis-world",  # uncomment once available on PyPI; otherwise install per docs/INSTALL.md
+
+    # --- Core scientific stack ---
+    "pyyaml>=6.0",
+    "jsonschema>=4.20",          # YAML config validation against JSON Schema
+
+    # --- Data and logging ---
+    "h5py>=3.10",                # HDF5 for state/sensor logging
+    "mcap>=1.1",                 # MCAP (ROS2 bag format) for sensor streams
+    "mcap-ros2-support>=0.5",
+    "pandas>=2.1",
+
+    # --- Robotics and control ---
+    "yourdfpy>=0.0.50",          # URDF parsing and validation (modern urdfpy fork)
+    #"pin>=2.7",                  # Pinocchio — rigid body dynamics, IK, FK
+    "casadi>=3.6",               # CasADi — MPC solver backend
+    "scipy",                     # EKF, optimisation
+
+    # --- Path planning ---
+    "networkx>=3.2",             # Graph-based planning (A*, D* Lite)
+    "scikit-image>=0.22",        # Traversability map processing
+
+    # --- Visualization (optional but recommended) ---
+    "fastapi>=0.108",            # Dashboard backend
+    "uvicorn>=0.25",
+    "websockets>=12.0",
+
+    # --- Utilities ---
+    "click>=8.1",                # CLI entry points
+    "rich>=13.7",                # Console output formatting
+    "tqdm>=4.66",                # Progress bars for batch runs
+]
+
+[project.optional-dependencies]
+# Full RL training stack (Phase 7+)
+rl = [
+    "torch>=2.1",
+    "stable-baselines3>=2.2",
+    "gymnasium>=0.29",
+    "ray[rllib]>=2.9",
+    "wandb>=0.16",
+]
+
+# Development and testing
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "mypy>=1.8",
+    "ruff>=0.1",
+    "pre-commit>=3.6",
+]
+
+# ROS2 hardware-in-the-loop (requires ROS2 Humble+ installed)
+ros2 = [
+    "rclpy",       # installed via ROS2, not pip
+    "sensor_msgs",
+    "geometry_msgs",
+    "nav_msgs",
+]
+
+# Dashboard frontend build (Node.js / React)
+dashboard = [
+    "nodeenv>=1.8",
+]
+
+# Video export
+video = [
+    "opencv-python>=4.9",
+    "imageio[ffmpeg]>=2.33",
+]
+
+[project.scripts]
+moon-rover = "moon_rover.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires CUDA GPU (deselect with '-m not gpu')",
+    "slow: long-running tests (deselect with '-m not slow')",
+    "genesis: requires Genesis engine installed",
+]

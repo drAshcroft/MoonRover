@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scene.yaml schema",
+  "description": "Validates the top-level structure of scene.yaml for the Moon Rover simulation.",
+  "type": "object",
+  "required": ["terrain", "rover", "moonbase"],
+  "additionalProperties": true,
+  "properties": {
+    "terrain": {
+      "type": "object",
+      "required": ["seed", "size_m", "resolution"],
+      "properties": {
+        "seed":           { "type": "integer" },
+        "size_m":         { "type": "number", "exclusiveMinimum": 0 },
+        "resolution":     { "type": "integer", "exclusiveMinimum": 0 },
+        "height_scale_m": { "type": "number", "exclusiveMinimum": 0 },
+        "features": {
+          "type": "object",
+          "properties": {
+            "craters":          { "type": "boolean" },
+            "num_craters":      { "type": "integer", "minimum": 0 },
+            "rocks":            { "type": "boolean" },
+            "num_rock_clusters":{ "type": "integer", "minimum": 0 },
+            "plains":           { "type": "boolean" },
+            "ridges":           { "type": "boolean" }
+          }
+        },
+        "material": {
+          "type": "object",
+          "required": ["name"],
+          "properties": {
+            "name":                 { "type": "string", "minLength": 1 },
+            "friction_coefficient": { "type": "number", "minimum": 0 },
+            "restitution":          { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        }
+      }
+    },
+    "sun": {
+      "type": "object",
+      "properties": {
+        "elevation_deg": { "type": "number" },
+        "azimuth_deg":   { "type": "number" },
+        "intensity":     { "type": "number", "minimum": 0 }
+      }
+    },
+    "rover": {
+      "type": "object",
+      "properties": {
+        "type_ref":         { "type": "string", "minLength": 1 },
+        "sensor_config_ref":{ "type": "string" },
+        "position":         { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+        "orientation":      { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+      }
+    },
+    "moonbase": {
+      "type": "object",
+      "properties": {
+        "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+        "beacon": {
+          "type": "object",
+          "properties": {
+            "frequency_hz":         { "type": "number", "exclusiveMinimum": 0 },
+            "signal_strength":      { "type": "number" },
+            "communication_range_m":{ "type": "number", "exclusiveMinimum": 0 }
+          }
+        },
+        "docking": {
+          "type": "object",
+          "properties": {
+            "num_ports":         { "type": "integer", "minimum": 1 },
+            "charging_power_w":  { "type": "number", "minimum": 0 },
+            "port_positions": {
+              "type": "array",
+              "items": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

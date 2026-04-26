@@ -1,0 +1,317 @@
+# Moon Rover Scene Configuration
+# Per System 3.2 - Scene Composition and Environment Setup
+# This file defines the complete scene environment including terrain,
+# lighting, rover placement, mission grid, and moonbase station.
+
+# ============================================================================
+# TERRAIN CONFIGURATION
+# ============================================================================
+
+terrain:
+  # Procedural terrain generation seed
+  # Same seed produces identical terrain across simulations (for reproducibility)
+  # Range: 0-2147483647; -1 for random
+  seed: 12345
+
+  # Terrain size in the x-y plane (meters)
+  # Creates a square terrain of size_m x size_m
+  size_m: 500
+
+  # Terrain resolution (samples per side)
+  # Higher resolution = more detailed terrain but slower simulation
+  # Typical range: 64-1024 (must be power of 2)
+  resolution: 256
+
+  # Vertical scale for terrain height variation (meters)
+  # Controls the amplitude of terrain features; higher = more rugged
+  height_scale_m: 10.0
+
+  # Terrain generation features to enable
+  features:
+    # Enable crater generation (realistic Moon surface)
+    craters: true
+
+    # Number of craters to generate
+    num_craters: 50
+
+    # Enable rocky outcrops and boulders
+    rocks: true
+
+    # Number of boulder clusters to place
+    num_rock_clusters: 30
+
+    # Enable smooth lava plains (basalt regions)
+    plains: true
+
+    # Enable ridge formations
+    ridges: true
+
+  # Material properties for terrain
+  material:
+    # Material name reference (must exist in physics materials database)
+    name: lunar_regolith
+
+    # Friction coefficient for wheel-terrain interaction
+    friction_coefficient: 0.6
+
+    # Restitution (bounciness; 0 = no bounce, 1 = perfect bounce)
+    restitution: 0.3
+
+    # Density in kg/m³
+    density: 1600
+
+
+# ============================================================================
+# SUN AND LIGHTING
+# ============================================================================
+
+sun:
+  # Sun elevation angle above horizon (degrees)
+  # Range: -90 (below horizon) to +90 (zenith)
+  # Typical day-time values: 0-90; night values: -90 to 0
+  elevation_degrees: 45.0
+
+  # Sun azimuth angle (compass direction, degrees)
+  # 0 = North, 90 = East, 180 = South, 270 = West
+  azimuth_degrees: 135.0
+
+  # Solar intensity multiplier (1.0 = baseline solar noon)
+  # Used to simulate time of day effects on power generation
+  intensity: 1.0
+
+  # Enable day-night cycle simulation
+  day_cycle:
+    # Enable dynamic sun movement
+    enabled: false
+
+    # Lunar day length in simulation seconds
+    # Actual lunar day is ~29.5 Earth days = 2,551,443 seconds
+    # Use smaller value for testing (e.g., 3600 = 1 hour per lunar day)
+    period_seconds: 3600
+
+    # Current time in lunar day cycle (0.0-1.0)
+    # 0.0 = lunar midnight, 0.5 = lunar noon, 1.0 = next midnight
+    current_phase: 0.5
+
+  # Shadow and lighting quality
+  rendering:
+    # Shadow map resolution (pixels)
+    # Higher = better shadow quality but more GPU memory
+    shadow_resolution: 2048
+
+    # Enable ambient occlusion (darkens crevices, more realistic)
+    ambient_occlusion: true
+
+    # Ambient light intensity (0.0-1.0)
+    # Prevents complete darkness, simulates indirect lighting
+    ambient_intensity: 0.3
+
+
+# ============================================================================
+# ROVER PLACEMENT AND CONFIGURATION
+# ============================================================================
+
+rover:
+  # Type of rover to instantiate
+  # Reference to a rover profile defined in rover.yaml
+  # Options: two_wheel_diff, three_wheel_tricycle, four_wheel_skid
+  type_ref: four_wheel_skid
+
+  # Unique identifier for this rover instance
+  rover_id: rover_001
+
+  # Rover spawn position [x, y, z] in meters
+  # z should be slightly above terrain to avoid penetration
+  position: [10.0, 10.0, 0.5]
+
+  # Rover spawn orientation (Euler angles in degrees) [roll, pitch, yaw]
+  # 0, 0, 0 = facing North with no tilt
+  orientation: [0.0, 0.0, 0.0]
+
+  # Sensor configuration reference
+  # Points to sensor configuration in sensors.yaml
+  sensor_config_ref: sensor_suite_001
+
+  # Rover initial state
+  initial_state:
+    # Initial linear velocity [vx, vy, vz] in m/s (usually 0 for static start)
+    linear_velocity: [0.0, 0.0, 0.0]
+
+    # Initial angular velocity [wx, wy, wz] in rad/s
+    angular_velocity: [0.0, 0.0, 0.0]
+
+
+# ============================================================================
+# MISSION GRID CONFIGURATION
+# ============================================================================
+
+mission:
+  # Reference to mission grid definition in mission.yaml
+  grid_ref: exploration_grid_01
+
+  # Mission type
+  # Options: exploration, deployment, retrieval, communication_relay
+  mission_type: exploration
+
+  # Mission name (for logging and identification)
+  mission_name: Lunar Base Survey Mission
+
+  # Target waypoints for rover navigation (optional override)
+  # If not specified, uses waypoints from mission.yaml grid
+  waypoints: []
+
+
+# ============================================================================
+# MOONBASE STATION CONFIGURATION
+# ============================================================================
+
+moonbase:
+  # Moonbase position [x, y, z] in meters (absolute world coordinates)
+  position: [0.0, 0.0, 0.0]
+
+  # Moonbase orientation (Euler angles) [roll, pitch, yaw] in degrees
+  # Typically [0, 0, 0] for level ground installation
+  orientation: [0.0, 0.0, 0.0]
+
+  # Moonbase type/model reference
+  # Used to load appropriate 3D model and properties
+  model_ref: moonbase_standard
+
+  # Communication beacon parameters
+  beacon:
+    # GPS beacon frequency (Hz)
+    # Rovers receive position corrections at this rate
+    frequency_hz: 1.0
+
+    # Beacon signal strength (used for signal range calculation)
+    signal_strength: 1.0
+
+    # Communication range from moonbase (meters)
+    # Rovers within range can receive beacon signal
+    communication_range_m: 1000.0
+
+  # Power transmission parameters (if moonbase acts as power source)
+  power:
+    # Enable wireless power transmission (not implemented yet)
+    wireless_power: false
+
+    # Maximum power transmission range (meters)
+    transmission_range_m: 100.0
+
+    # Efficiency of wireless power transfer (0.0-1.0)
+    efficiency: 0.8
+
+  # Docking/charging station parameters
+  docking:
+    # Enable docking port
+    enabled: true
+
+    # Number of rovers that can dock simultaneously
+    num_ports: 2
+
+    # Docking port position relative to moonbase center
+    port_positions:
+      - [2.0, 0.0, 0.0]   # Port 1 (front)
+      - [-2.0, 0.0, 0.0]  # Port 2 (back)
+
+    # Charging power available at each port (watts)
+    charging_power_w: 500
+
+
+# ============================================================================
+# ENVIRONMENT AND ATMOSPHERE
+# ============================================================================
+
+environment:
+  # Atmospheric properties (Moon has virtually no atmosphere)
+  # These are kept for potential future use or other celestial bodies
+
+  # Air density (kg/m³)
+  # Moon: ~0 (extreme vacuum)
+  # Used for drag calculations if enabled
+  air_density: 0.0
+
+  # Wind simulation (disabled for Moon, no atmosphere)
+  wind:
+    enabled: false
+
+    # Wind speed (m/s)
+    speed: 0.0
+
+    # Wind direction (degrees from North)
+    direction: 0.0
+
+  # Radiation effects (Moon is exposed to solar radiation)
+  # Used for thermal modeling (not currently implemented)
+  solar_radiation:
+    # Solar radiation intensity (W/m²)
+    # Lunar: ~1360 W/m² (similar to Earth's atmospheric top)
+    intensity_wm2: 1360
+
+    # Enable thermal effects on rover electronics
+    enable_thermal_effects: false
+
+
+# ============================================================================
+# VISUALIZATION AND RENDERING
+# ============================================================================
+
+visualization:
+  # Enable 3D visualization window
+  # Set to false for headless simulation (faster)
+  enabled: true
+
+  # Camera type and initial position
+  # Options: follow_rover, fixed_overhead, first_person
+  camera_mode: follow_rover
+
+  # Camera follow distance when in follow_rover mode (meters)
+  follow_distance: 15.0
+
+  # Render quality level
+  # Options: low (fast), medium, high (slow, high quality)
+  quality: medium
+
+  # Field of view (degrees)
+  fov_degrees: 60.0
+
+  # Enable grid overlay (helpful for navigation visualization)
+  show_grid: true
+
+  # Grid cell size (meters)
+  grid_cell_size: 10.0
+
+  # Show mission waypoints
+  show_waypoints: true
+
+  # Show rover sensor information overlay
+  show_sensor_overlay: false
+
+
+# ============================================================================
+# DEBUGGING AND LOGGING
+# ============================================================================
+
+debug:
+  # Enable scene debug mode
+  enabled: false
+
+  # Show terrain mesh wireframe
+  show_terrain_wireframe: false
+
+  # Show rigid body frames and axes
+  show_body_frames: false
+
+  # Show contact points and normals
+  show_contacts: false
+
+  # Log scene events to console
+  log_events: false
+
+  # Save scene state snapshots
+  # Useful for post-simulation analysis
+  save_snapshots: false
+
+  # Snapshot save interval (frames)
+  # 0 = no snapshots; 100 = every 100 frames
+  snapshot_interval: 0
