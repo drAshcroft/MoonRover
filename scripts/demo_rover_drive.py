@@ -116,6 +116,9 @@ def parse_args() -> argparse.Namespace:
                         help="Disable keyboard input (useful for recording / CI).")
     parser.add_argument("--destroy", action="store_true",
                         help="Explicitly tear down Genesis on exit.")
+    parser.add_argument("--self-test", action="store_true",
+                        help="Inject a scripted drive+arm command sequence "
+                             "(no keyboard) to verify balance under motion.")
     return parser.parse_args()
 
 
@@ -262,50 +265,129 @@ class KeyboardPoll:
 
 
 class BalanceController:
-    """Self-balancing PD controller that biases drive velocity by body pitch.
+    """Cascaded wheel-torque self-balancing controller (Segway architecture).
 
-    The output is a forward velocity correction (m/s) added on top of the
-    user's drive command. The velocity then enters the drive system's inner
-    PD loop (Kv = max_torque_nm) which applies wheel torque proportional to
-    the velocity error, producing the reaction torque that drives the
-    inverted-pendulum body back upright.
+    Torque control — not a velocity setpoint. An inverted pendulum needs a
+    *continuous* restoring torque proportional to lean; a velocity-control
+    inner loop only produces torque transiently while accelerating and cannot
+    hold the steady-state moment of a top-heavy body, which is why the original
+    velocity-cascade design drifted and fell.
+
+    Two nested loops:
+
+    * **Inner (fast, stiff)** — drives body pitch to a lean *setpoint* with a
+      high-gain PD on wheel torque::
+
+          tau_common = k_theta * (pitch - theta_sp) + k_theta_d * pitch_rate
+
+      +pitch = forward lean; +torque drives the wheels forward, whose reaction
+      torque and base motion both reduce the lean, so +(pitch-theta_sp) → +tau.
+
+    * **Outer (slow, gentle)** — picks ``theta_sp`` so the rover regulates
+      ground speed to ``v_ref`` and station-keeps. To go faster forward the
+      body must lean forward, so a positive speed error commands a positive
+      lean. The **velocity integral** is what rejects the constant forward
+      moment of the stowed arm (a pure PD leaves a standing drift)::
+
+          theta_sp = kp_v*(v_ref - v) + ki_v*∫(v_ref - v) + kp_x*(x_ref - x)
+
+    A differential yaw torque is layered on top for steering.
     """
 
     def __init__(
         self,
-        kp: float = 18.0,
-        kd: float = 2.5,
-        k_vel: float = 1.0,
-        max_bias_mps: float = 3.0,
+        *,
+        k_theta: float = 35.0,
+        k_theta_d: float = 13.0,
+        kp_v: float = 0.16,
+        ki_v: float = 0.045,
+        kp_x: float = 0.018,
+        k_yaw: float = 6.0,
+        max_lean_rad: float = 0.30,
+        v_int_clamp: float = 6.0,
+        d_filter_alpha: float = 0.25,
+        max_torque_nm: float = 150.0,
     ) -> None:
-        self.kp = kp
-        self.kd = kd
-        self.k_vel = k_vel
-        self.max_bias = max_bias_mps
+        # Env overrides for fast headless gain sweeps: MR_K_THETA, MR_K_THETA_D,
+        # MR_KP_V, MR_KI_V, MR_KP_X, MR_K_YAW, MR_MAX_LEAN, MR_D_ALPHA.
+        def _env(name: str, default: float) -> float:
+            try:
+                return float(os.environ[name])
+            except (KeyError, ValueError):
+                return default
+
+        self.k_theta = _env("MR_K_THETA", k_theta)
+        self.k_theta_d = _env("MR_K_THETA_D", k_theta_d)
+        self.kp_v = _env("MR_KP_V", kp_v)
+        self.ki_v = _env("MR_KI_V", ki_v)
+        self.kp_x = _env("MR_KP_X", kp_x)
+        self.k_yaw = _env("MR_K_YAW", k_yaw)
+        self.max_lean = _env("MR_MAX_LEAN", max_lean_rad)
+        self.d_alpha = _env("MR_D_ALPHA", d_filter_alpha)
+        self.v_int_clamp = v_int_clamp
+        self.max_torque = max_torque_nm
         self._prev_pitch: Optional[float] = None
+        self._pitch_rate_f = 0.0
+        self._v_int = 0.0
+        self._x = 0.0
+        self._x_ref = 0.0
 
     def reset(self) -> None:
         self._prev_pitch = None
+        self._pitch_rate_f = 0.0
+        self._v_int = 0.0
+        self._x = 0.0
+        self._x_ref = 0.0
 
-    def step(self, pitch_rad: float, body_vx_mps: float, dt: float) -> float:
-        """Compute velocity bias.
-
-        Positive pitch = nose down (forward lean). Drive the wheels in the
-        direction of the fall so the contact point moves under the COM. The
-        ``body_vx_mps`` term suppresses drift: when the rover is coasting but
-        the user commanded zero, we bleed the bias back toward zero.
-        """
+    def step(
+        self,
+        *,
+        pitch_rad: float,
+        body_v_mps: float,
+        yaw_rate_radps: float,
+        v_ref_mps: float,
+        w_ref_radps: float,
+        dt: float,
+    ) -> tuple[float, float]:
+        """Return (tau_left, tau_right) wheel torques in N·m."""
         if self._prev_pitch is None or dt <= 0.0:
-            pitch_rate = 0.0
+            pitch_rate_raw = 0.0
         else:
-            pitch_rate = (pitch_rad - self._prev_pitch) / dt
+            pitch_rate_raw = (pitch_rad - self._prev_pitch) / dt
         self._prev_pitch = pitch_rad
-        bias = (
-            self.kp * pitch_rad
-            + self.kd * pitch_rate
-            - self.k_vel * body_vx_mps
+        # Low-pass the finite-difference rate: a raw 120 Hz quaternion
+        # derivative is noisy enough that a stiff k_theta_d would chatter the
+        # motor torque and ring the inner loop.
+        self._pitch_rate_f += self.d_alpha * (pitch_rate_raw - self._pitch_rate_f)
+        pitch_rate = self._pitch_rate_f
+
+        # Travelled distance vs. commanded reference (station-keeping when
+        # v_ref == 0, rides along while the operator drives).
+        self._x += body_v_mps * dt
+        self._x_ref += v_ref_mps * dt
+
+        # --- Outer loop: speed/position error -> desired lean ---------------
+        v_err = v_ref_mps - body_v_mps
+        self._v_int += v_err * dt
+        self._v_int = max(-self.v_int_clamp, min(self.v_int_clamp, self._v_int))
+        theta_sp = (
+            self.kp_v * v_err
+            + self.ki_v * self._v_int
+            + self.kp_x * (self._x_ref - self._x)
         )
-        return float(max(-self.max_bias, min(self.max_bias, bias)))
+        theta_sp = max(-self.max_lean, min(self.max_lean, theta_sp))
+
+        # --- Inner loop: stiff PD drives pitch to theta_sp -----------------
+        tau_common = (
+            self.k_theta * (pitch_rad - theta_sp)
+            + self.k_theta_d * pitch_rate
+        )
+        tau_yaw = self.k_yaw * (w_ref_radps - yaw_rate_radps)
+
+        lo, hi = -self.max_torque, self.max_torque
+        tau_left = max(lo, min(hi, tau_common - tau_yaw))
+        tau_right = max(lo, min(hi, tau_common + tau_yaw))
+        return float(tau_left), float(tau_right)
 
 
 def _euler_from_quat_wxyz(q: np.ndarray) -> tuple[float, float, float]:
@@ -412,6 +494,59 @@ class ArmBridge:
                 pass
 
 
+class WheelTorqueActuator:
+    """Direct-torque actuation of the two wheel DOFs.
+
+    Bypasses the production drive system's velocity controller (which cannot
+    balance an inverted pendulum) and instead applies raw motor torque to the
+    left/right wheel joints, reading their angular velocity back for state
+    feedback. The drive system is still used for odometry/telemetry but its
+    ``update()`` (velocity command) is not called for this profile.
+    """
+
+    def __init__(self, entity, wheel_dofs_local: list[int], wheel_radius_m: float) -> None:
+        self._entity = entity
+        self._dofs = list(wheel_dofs_local)  # canonical order: [left, right]
+        self._r = float(wheel_radius_m)
+        # Pure torque mode: kill any position/velocity servo gains the drive
+        # system installed on the wheel DOFs so they free-spin under torque.
+        n = len(self._dofs)
+        for setter, val in (("set_dofs_kp", 0.0), ("set_dofs_kv", 0.0)):
+            try:
+                getattr(self._entity, setter)(
+                    **{setter.split("_")[-1]: np.zeros(n, dtype=np.float32)},
+                    dofs_idx_local=self._dofs,
+                )
+            except (AttributeError, TypeError):
+                pass
+
+    def wheel_omega(self) -> tuple[float, float]:
+        try:
+            v = self._entity.get_dofs_velocity(dofs_idx_local=self._dofs)
+            if hasattr(v, "cpu"):
+                v = v.detach().cpu().numpy() if hasattr(v, "detach") else v.cpu().numpy()
+            arr = np.asarray(v, dtype=np.float64).flatten()
+            if arr.size >= 2:
+                return float(arr[0]), float(arr[1])
+        except (AttributeError, TypeError, IndexError):
+            pass
+        return 0.0, 0.0
+
+    def body_velocity(self) -> float:
+        """Forward ground velocity (m/s) from mean wheel angular velocity."""
+        ol, orr = self.wheel_omega()
+        return self._r * 0.5 * (ol + orr)
+
+    def apply(self, tau_left: float, tau_right: float) -> None:
+        try:
+            self._entity.control_dofs_force(
+                force=np.array([tau_left, tau_right], dtype=np.float32),
+                dofs_idx_local=self._dofs,
+            )
+        except (AttributeError, TypeError):
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Header / telemetry
 # ---------------------------------------------------------------------------
@@ -437,7 +572,7 @@ def print_header(args: argparse.Namespace, profile: dict) -> None:
         print("        1..4 select joint   [ / ] jog joint  O/C gripper  Z stow")
         print("        R reset pose   ESC/Q quit")
     print("=" * 92)
-    print("  step |  sim_t  |  pose (x, y, yaw_deg) | pitch/roll_deg | v_user/v_bal | v/w cmd | SoC")
+    print("  step |  sim_t  |  pose (x, y, yaw_deg) | pitch/roll_deg | v_user/v_meas | tauL/tauR | SoC")
     print("-" * 92)
 
 
@@ -446,9 +581,9 @@ def print_telemetry(
     step: int,
     sim_t: float,
     v_user: float,
-    v_bal: float,
-    v_cmd: float,
-    w_cmd: float,
+    v_meas: float,
+    tau_left: float,
+    tau_right: float,
     pitch: float,
     roll: float,
     yaw: float,
@@ -459,8 +594,8 @@ def print_telemetry(
         f"  {step:5d} | {sim_t:6.2f} | "
         f"({float(pos[0]):+5.2f},{float(pos[1]):+5.2f},{math.degrees(yaw):+6.1f}) | "
         f"{math.degrees(pitch):+6.1f}/{math.degrees(roll):+6.1f} | "
-        f"{v_user:+4.2f}/{v_bal:+4.2f} | "
-        f"{v_cmd:+4.2f}/{w_cmd:+4.2f} | "
+        f"{v_user:+5.2f}/{v_meas:+5.2f} | "
+        f"{tau_left:+6.1f}/{tau_right:+6.1f} | "
         f"{soc * 100.0:5.1f}%"
     )
 
@@ -511,17 +646,34 @@ def main() -> int:
     try:
         engine.configure(cfg, show_viewer=not args.no_viewer, viewer_options=viewer_options)
 
-        engine.add_entity("ground", gs.morphs.Plane(), gs.materials.Rigid(friction=1.2))
+        ground_friction = 1.2
+        engine.add_entity(
+            "ground", gs.morphs.Plane(), gs.materials.Rigid(friction=ground_friction)
+        )
 
         spawn_z = spawn_height_for(rover_yaml, profile)
         rover_morph = gs.morphs.URDF(file=urdf_path, fixed=False, pos=(0.0, 0.0, spawn_z))
-        engine.add_entity(ROVER_NAME, rover_morph, gs.materials.Rigid())
+        # Match the rover's contact friction to the regolith ground so the
+        # wheels actually get the grip the balance controller assumes.
+        engine.add_entity(
+            ROVER_NAME, rover_morph, gs.materials.Rigid(friction=ground_friction)
+        )
 
         engine.build_scene()
 
         drive_config = drive_config_from_profile(profile, DriveType.TWO_WHEEL_DIFF)
         drive = create_drive_system(drive_config)
         drive.attach(engine, ROVER_NAME)
+
+        # Direct-torque actuator over the resolved wheel DOFs. Balancing an
+        # inverted pendulum requires torque control, so we drive the wheels
+        # ourselves rather than through the drive system's velocity loop.
+        wheel_dofs = [int(h.dofs_idx_local) for h in drive._wheels]
+        wheel_actuator = WheelTorqueActuator(
+            engine.get_entity(ROVER_NAME),
+            wheel_dofs,
+            wheel_radius_m=float(drive._config.wheel_radius_m),
+        )
 
         solar_cfg, battery_cfg, budget = power_config_from_yaml(power_cfg)
         power = RoverPowerSystem()
@@ -550,12 +702,16 @@ def main() -> int:
                 compliance_model="linear",
             ),
         )
-        # Stow pose: arm folded up over the chassis so the mass sits close to
-        # the wheel axle. Joint 2 lifts the shoulder, joint 3 folds the elbow
-        # back — the tip ends up just above the chassis top, well within the
-        # pitch envelope the PD balance loop can correct.
+        # Stow pose: shoulder (joint 2) lifts link 2 vertical, then the elbow
+        # (joint 3) folds link 3+ back *over the base* rather than out in front.
+        # The earlier [0,-pi/2,+pi/2,0] pose unfolded the elbow forward, parking
+        # ~2 kg of arm ~0.7 m ahead of the axle — a large constant pitching
+        # moment that forced the balancer into a permanent ~11° back-lean.
+        # Folding the elbow back (joint 3 = -pi/2) keeps the arm COM ~0.2 m of
+        # the axle so the rover balances near-upright. (Joints clamp at ±pi/2;
+        # 1.55 rad stays just inside the limit to avoid limit chatter.)
         arm.set_joint_positions(
-            np.array([0.0, -math.pi / 2.0, math.pi / 2.0, 0.0], dtype=np.float64)
+            np.array([0.0, -1.55, -1.55, 0.0], dtype=np.float64)
         )
 
         arm_bridge = ArmBridge(
@@ -565,14 +721,42 @@ def main() -> int:
             stroke_m=float(arm_cfg_yaml.get("gripper", {}).get("stroke_m", 0.1)),
         )
 
-        balance = BalanceController(kp=6.0, kd=0.8, max_bias_mps=2.5)
+        # Traction-limited torque cap. On the moon the rover only weighs
+        # m*g ≈ 41 N, so each wheel can transmit at most ~mu*(m*g/2)*r ≈ a few
+        # N·m before it slips. Commanding the motor's 150 N·m just spins the
+        # wheels and the body falls — so cap the balance torque at the friction
+        # cone (with a little headroom) instead of the motor rating.
+        try:
+            m_total = float(engine.get_entity(ROVER_NAME).get_mass())
+        except Exception:
+            m_total = 25.55
+        g_mag = abs(float(cfg.gravity_vector[2])) or 1.622
+        mu_eff = ground_friction
+        n_wheels = 2
+        tau_slip_per_wheel = mu_eff * (m_total * g_mag / n_wheels) * float(
+            drive._config.wheel_radius_m
+        )
+        # 1.5x headroom: the trailing wheel carries extra normal load under a
+        # pitch correction, and brief micro-slip is acceptable.
+        tau_cap = min(
+            float(drive._config.max_torque_nm), 1.5 * tau_slip_per_wheel
+        )
+        print(
+            f"  Traction    : m={m_total:.1f} kg, g={g_mag:.3f} m/s^2, "
+            f"mu={mu_eff:.2f} -> slip ~{tau_slip_per_wheel:.2f} N·m/wheel, "
+            f"torque cap {tau_cap:.2f} N·m"
+        )
+        balance = BalanceController(max_torque_nm=tau_cap)
 
         keyboard = None
         if not args.no_viewer and not args.no_keyboard:
             keyboard = KeyboardPoll()
             keyboard.start()
 
-        run_loop(engine, drive, power, arm, arm_bridge, balance, keyboard, cfg, args, spawn_z)
+        run_loop(
+            engine, drive, wheel_actuator, power, arm, arm_bridge, balance,
+            keyboard, cfg, args, spawn_z,
+        )
         completed_cleanly = True
 
     except KeyboardInterrupt:
@@ -598,6 +782,7 @@ def main() -> int:
 def run_loop(
     engine: GenesisPhysicsEngine,
     drive,
+    wheel_actuator: WheelTorqueActuator,
     power: RoverPowerSystem,
     arm: SerialArm,
     arm_bridge: ArmBridge,
@@ -615,6 +800,8 @@ def run_loop(
 
     v_user = 0.0
     w_user = 0.0
+    prev_yaw: Optional[float] = None  # for finite-difference yaw rate
+    self_test_arm_phase = 0  # advances as scripted arm moves fire
     selected_joint = 0  # 0..3 index into arm joint positions
     jog_step = 0.05  # radians per keypress
     v_step = 0.2  # m/s per W/S press
@@ -622,6 +809,36 @@ def run_loop(
 
     while True:
         t = engine.get_sim_time()
+
+        # Scripted command sequence: settle, drive forward, stop, spin, stop,
+        # then perturb the arm (lift) and re-stow — all while balancing.
+        if args.self_test:
+            if t < 4.0:
+                v_user, w_user = 0.0, 0.0
+            elif t < 8.0:
+                v_user, w_user = 0.4, 0.0
+            elif t < 11.0:
+                v_user, w_user = 0.0, 0.0
+            elif t < 15.0:
+                v_user, w_user = 0.0, 0.7
+            elif t < 18.0:
+                v_user, w_user = 0.0, 0.0
+            else:
+                v_user, w_user = 0.0, 0.0
+            # Gentle wrist/elbow nudge — proves the arm can move under the
+            # balancer. A *large* fast slew exceeds the lunar traction budget
+            # (~5 N·m/wheel) and will tip the rover; that is a physical limit
+            # of balancing under 1/6 g, not a controller fault.
+            if self_test_arm_phase == 0 and t >= 18.0:
+                arm.set_joint_positions(
+                    np.array([0.0, -1.55, -1.30, -0.20], dtype=np.float64)
+                )
+                self_test_arm_phase = 1
+            elif self_test_arm_phase == 1 and t >= 21.0:
+                arm.set_joint_positions(
+                    np.array([0.0, -1.55, -1.55, 0.0], dtype=np.float64)
+                )
+                self_test_arm_phase = 2
 
         # 1. Drain keyboard events.
         if keyboard is not None:
@@ -662,45 +879,50 @@ def run_loop(
                 elif lower == "r":
                     _reset_pose(engine, spawn_z)
                     balance.reset()
+                    prev_yaw = None
                     v_user = 0.0
                     w_user = 0.0
 
-        # 2. Read body pose → balance correction.
+        # 2. Read body attitude and wheel state → balance torque.
         _, quat = engine.get_body_pose(ROVER_NAME)
         quat_arr = np.asarray(quat).flatten()
         roll, pitch, yaw = _euler_from_quat_wxyz(quat_arr)
 
-        # Body forward velocity from wheel encoders. Average wheel angular
-        # speed times radius, minus the user's commanded velocity so the
-        # drift term only sees unintended motion.
-        wheel_states = drive.get_wheel_states()
-        if len(wheel_states) >= 2:
-            wheel_radius = float(drive._config.wheel_radius_m)
-            avg_omega = 0.5 * (wheel_states[0].angular_velocity + wheel_states[1].angular_velocity)
-            body_vx = wheel_radius * avg_omega - v_user
+        # Yaw rate by finite difference (wrapped).
+        if prev_yaw is None:
+            yaw_rate = 0.0
         else:
-            body_vx = 0.0
+            dyaw = math.atan2(math.sin(yaw - prev_yaw), math.cos(yaw - prev_yaw))
+            yaw_rate = dyaw / dt if dt > 0.0 else 0.0
+        prev_yaw = yaw
 
-        v_bias = balance.step(pitch, body_vx, dt)
+        # Forward ground velocity from the wheel encoders.
+        body_v = wheel_actuator.body_velocity()
 
-        v_cmd = v_user + v_bias
-        w_cmd = w_user
-        drive.command(DriveCommand(linear_velocity_mps=v_cmd, angular_velocity_radps=w_cmd))
+        tau_left, tau_right = balance.step(
+            pitch_rad=pitch,
+            body_v_mps=body_v,
+            yaw_rate_radps=yaw_rate,
+            v_ref_mps=v_user,
+            w_ref_radps=w_user,
+            dt=dt,
+        )
 
         # 3. Arm: update software state, push into Genesis.
         arm.update(dt)
         arm_bridge.sync()
 
-        # 4. Apply drive to physics + step.
-        drive.update(dt)
+        # 4. Apply wheel torque + step physics.
+        wheel_actuator.apply(tau_left, tau_right)
         engine.step(dt, render=not args.no_viewer)
 
         # 5. Power accounting.
+        driving = abs(v_user) > 0.05 or abs(w_user) > 0.05
         power.step(
             dt,
             sun_elevation=args.sun_elevation_deg,
             subsystem_states={
-                "mobility": "active" if abs(v_cmd) > 0.05 or abs(w_cmd) > 0.05 else "idle",
+                "mobility": "active" if driving else "idle",
                 "compute": "active",
                 "communication": "idle",
                 "cameras": "idle",
@@ -726,9 +948,9 @@ def run_loop(
                 step=step_count,
                 sim_t=t,
                 v_user=v_user,
-                v_bal=v_bias,
-                v_cmd=v_cmd,
-                w_cmd=w_cmd,
+                v_meas=body_v,
+                tau_left=tau_left,
+                tau_right=tau_right,
                 pitch=pitch,
                 roll=roll,
                 yaw=yaw,
