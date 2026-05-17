@@ -11,15 +11,25 @@ error.
 
 Keyboard controls (interactive viewer mode)
 -------------------------------------------
-    W / S     forward / reverse velocity target  (m/s)
-    A / D     spin left / right (yaw rate)       (rad/s)
-    Space     zero the drive command
-    1..4      select arm joint to jog
-    [ / ]     jog selected joint − / +           (rad)
-    O / C     open / close gripper
-    Z         stow arm to neutral pose
-    R         reset rover pose (respawn upright)
-    ESC / Q   quit cleanly
+Motion is on the **arrow keys**, not WASD: the Genesis viewer reserves A/D
+(auto-rotate / wireframe) and would swallow the drive keys, so steering moved
+to the arrows where it does not collide with a viewer hotkey.
+
+    Up / Down    forward / reverse velocity target  (m/s)
+    Left / Right spin left / right (yaw rate)       (rad/s)
+    Space        zero the drive command
+    1..4         select arm joint to jog
+    [ / ]        jog selected joint − / +           (rad)
+    O / C        open / close gripper
+    X            stow arm to neutral pose
+    R            reset rover pose (respawn upright)
+    ESC / Q      quit cleanly
+
+The viewer scene is a finite lunar heightfield (gentle near the spawn pad so
+the balancer stays upright), with scattered rocks, the moonbase, a trailing
+power/data cable that follows the rover, and wheel-rut decals whose depth comes
+from the analytic terramechanics model. Pass ``--flat-ground`` for the legacy
+bare infinite plane.
 
 Usage
 -----
@@ -116,6 +126,19 @@ from moon_rover.sensors import (  # noqa: E402
 )
 
 ROVER_NAME = "demo_rover"
+
+# Visible lunar-world scene (viewer only). Entities cannot be added to a Genesis
+# scene after build_scene(), so the cable and rut decals are fixed-size pools
+# allocated up front and then repositioned every physics step.
+WORLD_SIZE_M = 30.0
+WORLD_RESOLUTION = 80
+WORLD_FLAT_RADIUS_M = 4.0          # fully flat spawn pad (balancer-safe)
+WORLD_BLEND_RADIUS_M = 9.0         # height blends to full terrain by here
+WORLD_SEED = 4242
+CABLE_LINK_COUNT = 48
+RUT_DECAL_COUNT = 200
+RUT_DROP_SPACING_M = 0.22          # advance distance between rut stamps
+
 DEFAULT_PROFILE = "two_wheel_diff"
 DEFAULT_PHYSICS = _PROJECT_ROOT / "configs" / "physics.yaml"
 DEFAULT_ROVER = _PROJECT_ROOT / "configs" / "rover.yaml"
@@ -156,6 +179,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capability-demo", action="store_true",
                         help="Layer current subsystem telemetry onto the "
                              "2-wheel balance bot demo.")
+    parser.add_argument("--flat-ground", action="store_true",
+                        help="Use the legacy bare infinite ground plane instead "
+                             "of the lunar heightfield / rocks / cable scene. "
+                             "Headless runs always use the flat plane.")
     return parser.parse_args()
 
 
@@ -259,12 +286,25 @@ class KeyboardPoll:
             self._queue.clear()
             return out
 
+    # Arrow keys are reported as multi-byte sequences that differ per OS.
+    # Both loops normalise them to the tokens UP / DOWN / LEFT / RIGHT so the
+    # control handler can treat an arrow press as a single logical key.
+    _WIN_ARROWS = {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT"}
+    _POSIX_ARROWS = {"A": "UP", "B": "DOWN", "D": "LEFT", "C": "RIGHT"}
+
     # -- Windows ---------------------------------------------------------
     def _win_loop(self) -> None:
         import msvcrt
         while not self._stop.is_set():
             if msvcrt.kbhit():
                 ch = msvcrt.getwch()
+                # \x00 / \xe0 prefix a function/arrow key; the next read is the
+                # scan code (H/P/K/M for the arrows).
+                if ch in ("\x00", "\xe0"):
+                    code = msvcrt.getwch()
+                    ch = self._WIN_ARROWS.get(code, "")
+                    if not ch:
+                        continue
                 with self._lock:
                     self._queue.append(ch)
             else:
@@ -294,10 +334,21 @@ class KeyboardPoll:
         import select
         while not self._stop.is_set():
             r, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if r:
-                ch = sys.stdin.read(1)
-                with self._lock:
-                    self._queue.append(ch)
+            if not r:
+                continue
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                # Could be a bare ESC (quit) or a CSI arrow sequence
+                # ESC '[' 'A'..'D'. Peek without blocking; if nothing
+                # follows promptly it was a real ESC.
+                r2, _, _ = select.select([sys.stdin], [], [], 0.02)
+                if r2 and sys.stdin.read(1) == "[":
+                    code = sys.stdin.read(1)
+                    ch = self._POSIX_ARROWS.get(code, "")
+                    if not ch:
+                        continue
+            with self._lock:
+                self._queue.append(ch)
 
 
 # ---------------------------------------------------------------------------
@@ -1219,6 +1270,277 @@ class CapabilityShowcase:
         )
 
 
+def _surface(color: tuple[float, float, float]):
+    """Best-effort coloured surface; ``None`` if this Genesis build lacks it."""
+    try:
+        return gs.surfaces.Default(color=color)
+    except Exception:  # noqa: BLE001 - older/headless builds: fall back to default
+        return None
+
+
+class LunarWorld:
+    """Visible lunar scene: heightfield ground, rocks, moonbase, trailing
+    cable, and analytic wheel-rut decals.
+
+    Construction (terrain, props, and the cable/rut entity pools) happens in the
+    engine CONSTRUCTION phase via :meth:`construct`. During SIMULATION,
+    :meth:`step` slides the pre-allocated cable links along the rover→anchor
+    line and stamps recessed rut decals under the wheels, with sinkage taken
+    from the analytic terramechanics stack so the grooves track the real soil
+    model rather than a cosmetic constant.
+
+    The heightfield is flattened to z=0 inside ``WORLD_FLAT_RADIUS_M`` of the
+    spawn pad and blended to full fBm terrain by ``WORLD_BLEND_RADIUS_M`` so the
+    flat-tuned balance controller still launches cleanly.
+    """
+
+    def __init__(self, profile: dict, sun_elevation_deg: float) -> None:
+        self._size = WORLD_SIZE_M
+        self._res = WORLD_RESOLUTION
+        cx = cy = self._size / 2.0
+        self._center = np.array([cx, cy], dtype=np.float64)
+        # Anchor the cable at the moonbase, set off the flat pad on a diagonal.
+        self._anchor = np.array([cx - 7.0, cy - 7.0], dtype=np.float64)
+
+        crater = {
+            "count": 7,
+            "min_radius_m": 0.6,
+            "max_radius_m": 2.2,
+            "depth_ratio": 0.22,
+        }
+        terrain_cfg = TerrainConfig(
+            seed=WORLD_SEED,
+            size_m=self._size,
+            fBm_octaves=5,
+            fBm_amplitude=0.18,           # gentle: a textured surface, not dunes
+            crater_params=crater,
+            rock_density=0.01,
+            rille_enabled=True,
+            moonbase_position=(float(self._anchor[0]), float(self._anchor[1]), 0.0),
+            resolution=self._res,
+        )
+        self._terrain = LunarTerrainGenerator(
+            max_traversable_slope_deg=25.0,
+            rock_clearance_m=0.35,
+            moonbase_pad_radius_m=2.0,
+        ).generate(terrain_cfg)
+
+        self._height = self._flatten_spawn_pad(
+            np.asarray(self._terrain.height_field, dtype=np.float64)
+        )
+        self._cell = self._size / max(self._res - 1, 1)
+
+        # Analytic soil model — same stack the capability demo uses; here it
+        # only drives the visible rut depth.
+        self._terramechanics = default_analytic_terramechanics(
+            terrain=self._terrain,
+            terrain_size_m=self._size,
+            wheel_radius_m=float(profile["wheel_radius_m"]),
+            wheel_width_m=0.08,
+        )
+        self._track = float(profile["track_width_m"])
+        self._wheel_r = float(profile["wheel_radius_m"])
+        self._mass_kg = float(profile.get("mass_kg", 20.0))
+
+        self._rut_idx = 0
+        self._last_drop_xy: Optional[np.ndarray] = None
+        self._cable_n = CABLE_LINK_COUNT
+        self._rut_n = RUT_DECAL_COUNT
+
+    # -- geometry helpers ------------------------------------------------
+    @property
+    def center(self) -> tuple[float, float]:
+        return float(self._center[0]), float(self._center[1])
+
+    def _flatten_spawn_pad(self, h: np.ndarray) -> np.ndarray:
+        res = h.shape[0]
+        axis = np.linspace(0.0, self._size, res)
+        gx, gy = np.meshgrid(axis, axis)
+        dist = np.hypot(gx - self._center[0], gy - self._center[1])
+        # 0 inside the flat radius, 1 beyond the blend radius, smooth between.
+        t = np.clip(
+            (dist - WORLD_FLAT_RADIUS_M)
+            / max(WORLD_BLEND_RADIUS_M - WORLD_FLAT_RADIUS_M, 1e-6),
+            0.0,
+            1.0,
+        )
+        blend = t * t * (3.0 - 2.0 * t)  # smoothstep
+        return h * blend
+
+    def ground_z(self, x: float, y: float) -> float:
+        gx = np.clip(x / self._size * (self._res - 1), 0.0, self._res - 1)
+        gy = np.clip(y / self._size * (self._res - 1), 0.0, self._res - 1)
+        j0, i0 = int(math.floor(gx)), int(math.floor(gy))
+        j1, i1 = min(j0 + 1, self._res - 1), min(i0 + 1, self._res - 1)
+        tx, ty = gx - j0, gy - i0
+        top = self._height[i0, j0] * (1 - tx) + self._height[i0, j1] * tx
+        bot = self._height[i1, j0] * (1 - tx) + self._height[i1, j1] * tx
+        return float(top * (1 - ty) + bot * ty)
+
+    # -- construction phase ---------------------------------------------
+    def construct(self, engine: GenesisPhysicsEngine) -> None:
+        engine.add_terrain_entity(
+            "lunar_terrain",
+            self._height.astype(np.float32),
+            [self._size, self._size],
+        )
+
+        regolith = _surface((0.62, 0.60, 0.57))
+        rock_surf = _surface((0.40, 0.39, 0.37))
+        base_surf = _surface((0.75, 0.76, 0.80))
+
+        # Scattered boulders (skip any on/near the flat spawn pad).
+        rock_kw = {"entity_type": "fixed"}
+        if rock_surf is not None:
+            rock_kw["surface"] = rock_surf
+        placed = 0
+        for k, rock in enumerate(self._terrain.rock_positions):
+            rx, ry = float(rock[0]), float(rock[1])
+            radius = float(rock[3]) if len(rock) > 3 else 0.25
+            if np.hypot(rx - self._center[0], ry - self._center[1]) < (
+                WORLD_FLAT_RADIUS_M + 1.0
+            ):
+                continue
+            rz = self.ground_z(rx, ry) + radius
+            engine.add_entity(
+                f"rock_{k:03d}",
+                gs.morphs.Box(pos=(rx, ry, rz),
+                              size=(radius * 2, radius * 2, radius * 2)),
+                gs.materials.Rigid(friction=1.0),
+                **rock_kw,
+            )
+            placed += 1
+        self._rock_count = placed
+
+        # Moonbase: habitat block + comm tower + cable spool post at the anchor.
+        ax, ay = float(self._anchor[0]), float(self._anchor[1])
+        az = self.ground_z(ax, ay)
+        base_kw = {"entity_type": "fixed"}
+        if base_surf is not None:
+            base_kw["surface"] = base_surf
+        engine.add_entity(
+            "moonbase_hab",
+            gs.morphs.Box(pos=(ax, ay, az + 1.25), size=(4.0, 3.0, 2.5)),
+            gs.materials.Rigid(), **base_kw,
+        )
+        engine.add_entity(
+            "moonbase_tower",
+            gs.morphs.Box(pos=(ax + 1.6, ay + 1.2, az + 3.0),
+                          size=(0.18, 0.18, 6.0)),
+            gs.materials.Rigid(), **base_kw,
+        )
+        self._anchor_z = az + 0.4  # cable leaves the spool ~0.4 m up
+
+        # Cable link pool — thin beads, parked underground until positioned.
+        cable_surf = _surface((0.10, 0.10, 0.12))
+        cable_kw = {"entity_type": "kinematic"}
+        if cable_surf is not None:
+            cable_kw["surface"] = cable_surf
+        for i in range(self._cable_n):
+            engine.add_entity(
+                f"cable_link_{i:03d}",
+                gs.morphs.Box(pos=(0.0, 0.0, -50.0 - i),
+                              size=(0.12, 0.05, 0.05)),
+                gs.materials.Rigid(), **cable_kw,
+            )
+
+        # Rut decal pool — flat dark slabs recessed into the regolith.
+        rut_surf = _surface((0.22, 0.20, 0.18))
+        rut_kw = {"entity_type": "kinematic"}
+        if rut_surf is not None:
+            rut_kw["surface"] = rut_surf
+        for i in range(self._rut_n):
+            engine.add_entity(
+                f"rut_{i:03d}",
+                gs.morphs.Box(pos=(0.0, 0.0, -80.0 - i),
+                              size=(0.24, 0.13, 0.04)),
+                gs.materials.Rigid(), **rut_kw,
+            )
+
+    # -- simulation phase ------------------------------------------------
+    @staticmethod
+    def _yaw_quat(yaw: float) -> np.ndarray:
+        # Genesis base quaternion order is (w, x, y, z).
+        return np.array(
+            [math.cos(yaw * 0.5), 0.0, 0.0, math.sin(yaw * 0.5)],
+            dtype=np.float32,
+        )
+
+    def _place(self, engine: GenesisPhysicsEngine, name: str,
+               pos: np.ndarray, quat: np.ndarray) -> None:
+        try:
+            engine.set_body_pose(name, pos.astype(np.float32), quat)
+            engine.set_body_velocity(name, np.zeros(3, np.float32),
+                                     np.zeros(3, np.float32))
+        except Exception:  # noqa: BLE001 - never let a visual abort the sim
+            pass
+
+    def _update_cable(self, engine: GenesisPhysicsEngine,
+                      rover_pos: np.ndarray, yaw: float) -> None:
+        # Cable leaves the chassis rear and runs to the moonbase spool, sagging
+        # under 1/6 g between the two ends.
+        rear = rover_pos[:2] - 0.35 * np.array([math.cos(yaw), math.sin(yaw)])
+        p0 = np.array([rear[0], rear[1], float(rover_pos[2]) - 0.05])
+        p1 = np.array([self._anchor[0], self._anchor[1], self._anchor_z])
+        span = float(np.linalg.norm(p1[:2] - p0[:2]))
+        sag = min(0.45, 0.06 * span)
+        for i in range(self._cable_n):
+            s = i / max(self._cable_n - 1, 1)
+            xy = p0[:2] * (1 - s) + p1[:2] * s
+            z = p0[2] * (1 - s) + p1[2] * s - sag * math.sin(math.pi * s)
+            seg_yaw = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
+            self._place(engine, f"cable_link_{i:03d}",
+                        np.array([xy[0], xy[1], z]), self._yaw_quat(seg_yaw))
+
+    def _drop_ruts(self, engine: GenesisPhysicsEngine, rover_pos: np.ndarray,
+                   yaw: float, body_v: float,
+                   wheel_omega: tuple[float, float]) -> None:
+        xy = rover_pos[:2].astype(np.float64)
+        if self._last_drop_xy is not None:
+            if np.linalg.norm(xy - self._last_drop_xy) < RUT_DROP_SPACING_M:
+                return
+        if abs(body_v) < 0.03:
+            return
+        self._last_drop_xy = xy.copy()
+
+        # Lateral (left/right) wheel offset in world frame.
+        lat = np.array([-math.sin(yaw), math.cos(yaw)]) * (self._track * 0.5)
+        wheel_load = (self._mass_kg * 1.622) / 2.0
+        for side, omega in ((1.0, wheel_omega[0]), (-1.0, wheel_omega[1])):
+            wxy = xy + side * lat
+            cx = float(np.clip(wxy[0], 0.0, self._size))
+            cy = float(np.clip(wxy[1], 0.0, self._size))
+            state = self._terramechanics.update_wheel(
+                np.array([cx, cy, 0.0], dtype=np.float64),
+                wheel_angular_vel=omega,
+                ground_velocity=abs(body_v),
+                wheel_load_n=wheel_load,
+                contact_radius_m=max(0.04, self._wheel_r * 0.35),
+                cable_tension_n=0.0,
+            )
+            sink = float(max(state.rut_depth, state.sinkage))
+            sink = min(0.06, max(0.005, sink))
+            gz = self.ground_z(cx, cy)
+            # Recess the slab so its top sits one sinkage depth below grade.
+            z = gz - sink - 0.02
+            self._place(engine, f"rut_{self._rut_idx:03d}",
+                        np.array([cx, cy, z]), self._yaw_quat(yaw))
+            self._rut_idx = (self._rut_idx + 1) % self._rut_n
+
+    def step(self, engine: GenesisPhysicsEngine, rover_pos: np.ndarray,
+             yaw: float, body_v: float,
+             wheel_omega: tuple[float, float]) -> None:
+        self._update_cable(engine, rover_pos, yaw)
+        self._drop_ruts(engine, rover_pos, yaw, body_v, wheel_omega)
+
+    def print_summary(self) -> None:
+        print(
+            f"  World       : {self._size:.0f} m lunar heightfield, "
+            f"{self._rock_count} rocks, moonbase + trailing cable, "
+            f"analytic rut decals"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Header / telemetry
 # ---------------------------------------------------------------------------
@@ -1242,8 +1564,8 @@ def print_header(args: argparse.Namespace, profile: dict) -> None:
         print("  *** Subsequent runs are cached and start in seconds.              ***")
     if not args.no_viewer and not args.no_keyboard:
         print("-" * 92)
-        print("  Keys: W/S drive  A/D spin  Space stop")
-        print("        1..4 select joint   [ / ] jog joint  O/C gripper  Z stow")
+        print("  Keys: Up/Down drive  Left/Right spin  Space stop")
+        print("        1..4 select joint   [ / ] jog joint  O/C gripper  X stow")
         print("        R reset pose   ESC/Q quit")
     print("=" * 92)
     print("  step |  sim_t  |  pose (x, y, yaw_deg) | pitch/roll_deg | v_user/v_meas | tauL/tauR | SoC")
@@ -1301,14 +1623,25 @@ def main() -> int:
         Path(args.physics_config), args.sim_hz, use_gpu=(args.backend == "gpu")
     )
 
+    # The rich lunar scene is the default in the viewer; headless runs and
+    # --flat-ground keep the legacy bare plane so existing CI / balance-tuning
+    # behaviour (and determinism) is unchanged.
+    use_world = (not args.no_viewer) and (not args.flat_ground)
+    world: Optional[LunarWorld] = None
+    if use_world:
+        world = LunarWorld(profile, args.sun_elevation_deg)
+        spawn_xy = world.center
+    else:
+        spawn_xy = (0.0, 0.0)
+
     viewer_options = None
     if not args.no_viewer:
         viewer_options = gs.options.ViewerOptions(
             max_FPS=args.render_hz,
             refresh_rate=args.render_hz,
             run_in_thread=True,
-            camera_pos=(2.5, -2.5, 1.6),
-            camera_lookat=(0.0, 0.0, 0.5),
+            camera_pos=(spawn_xy[0] + 2.5, spawn_xy[1] - 2.5, 1.6),
+            camera_lookat=(spawn_xy[0], spawn_xy[1], 0.5),
             camera_fov=45,
         )
 
@@ -1321,12 +1654,21 @@ def main() -> int:
         engine.configure(cfg, show_viewer=not args.no_viewer, viewer_options=viewer_options)
 
         ground_friction = 1.2
-        engine.add_entity(
-            "ground", gs.morphs.Plane(), gs.materials.Rigid(friction=ground_friction)
-        )
+        if world is not None:
+            # Terrain uses the engine's regolith-tuned contact (friction 1.2),
+            # matching the rover material below.
+            world.construct(engine)
+        else:
+            engine.add_entity(
+                "ground", gs.morphs.Plane(),
+                gs.materials.Rigid(friction=ground_friction),
+            )
 
         spawn_z = spawn_height_for(rover_yaml, profile)
-        rover_morph = gs.morphs.URDF(file=urdf_path, fixed=False, pos=(0.0, 0.0, spawn_z))
+        rover_morph = gs.morphs.URDF(
+            file=urdf_path, fixed=False,
+            pos=(spawn_xy[0], spawn_xy[1], spawn_z),
+        )
         # Match the rover's contact friction to the regolith ground so the
         # wheels actually get the grip the balance controller assumes.
         engine.add_entity(
@@ -1352,6 +1694,8 @@ def main() -> int:
         solar_cfg, battery_cfg, budget = power_config_from_yaml(power_cfg)
         power = RoverPowerSystem()
         power.initialize(solar_cfg, battery_cfg, budget)
+        if world is not None:
+            world.print_summary()
         capability_demo = None
         if args.capability_demo:
             capability_demo = CapabilityShowcase(args, rover_yaml, profile)
@@ -1434,6 +1778,7 @@ def main() -> int:
         run_loop(
             engine, drive, wheel_actuator, power, arm, arm_bridge, balance,
             keyboard, cfg, args, spawn_z, capability_demo,
+            world=world, spawn_xy=spawn_xy,
         )
         completed_cleanly = True
 
@@ -1470,6 +1815,9 @@ def run_loop(
     args: argparse.Namespace,
     spawn_z: float,
     capability_demo: Optional[CapabilityShowcase] = None,
+    *,
+    world: Optional[LunarWorld] = None,
+    spawn_xy: tuple[float, float] = (0.0, 0.0),
 ) -> None:
     dt = cfg.timestep
     step_count = 0
@@ -1526,13 +1874,13 @@ def run_loop(
                 if ch == "\x1b" or lower == "q":  # ESC or Q
                     print("\n  Quit key pressed.")
                     return
-                elif lower == "w":
+                elif ch == "UP":
                     v_user = min(v_user + v_step, 2.0)
-                elif lower == "s":
+                elif ch == "DOWN":
                     v_user = max(v_user - v_step, -2.0)
-                elif lower == "a":
+                elif ch == "LEFT":
                     w_user = min(w_user + w_step, 2.0)
-                elif lower == "d":
+                elif ch == "RIGHT":
                     w_user = max(w_user - w_step, -2.0)
                 elif ch == " ":
                     v_user = 0.0
@@ -1553,17 +1901,18 @@ def run_loop(
                     arm.command_gripper(1.0)
                 elif lower == "c":
                     arm.command_gripper(0.0)
-                elif lower == "z":
+                elif lower == "x":
                     arm.stow()
                 elif lower == "r":
-                    _reset_pose(engine, spawn_z)
+                    _reset_pose(engine, spawn_z, spawn_xy)
                     balance.reset()
                     prev_yaw = None
                     v_user = 0.0
                     w_user = 0.0
 
         # 2. Read body attitude and wheel state → balance torque.
-        _, quat = engine.get_body_pose(ROVER_NAME)
+        rover_pos, quat = engine.get_body_pose(ROVER_NAME)
+        rover_pos = np.asarray(rover_pos, dtype=np.float64).reshape(3)
         quat_arr = np.asarray(quat).flatten()
         roll, pitch, yaw = _euler_from_quat_wxyz(quat_arr)
 
@@ -1594,6 +1943,12 @@ def run_loop(
         # 4. Apply wheel torque + step physics.
         wheel_actuator.apply(tau_left, tau_right)
         engine.step(dt, render=not args.no_viewer)
+
+        # 4b. Slide the trailing cable and stamp wheel-rut decals.
+        if world is not None:
+            world.step(
+                engine, rover_pos, yaw, body_v, wheel_actuator.wheel_omega()
+            )
 
         # 5. Power accounting.
         driving = abs(v_user) > 0.05 or abs(w_user) > 0.05
@@ -1669,13 +2024,22 @@ def run_loop(
             return
 
 
-def _reset_pose(engine: GenesisPhysicsEngine, spawn_z: float) -> None:
-    """Respawn the rover upright at the origin with zero velocity."""
+def _reset_pose(
+    engine: GenesisPhysicsEngine,
+    spawn_z: float,
+    spawn_xy: tuple[float, float] = (0.0, 0.0),
+) -> None:
+    """Respawn the rover upright at the spawn pad with zero velocity."""
     try:
         engine.set_body_pose(
             ROVER_NAME,
-            position=(0.0, 0.0, spawn_z),
-            quaternion=(1.0, 0.0, 0.0, 0.0),  # wxyz: identity
+            np.array([spawn_xy[0], spawn_xy[1], spawn_z], dtype=np.float32),
+            np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),  # wxyz identity
+        )
+        engine.set_body_velocity(
+            ROVER_NAME,
+            np.zeros(3, dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
         )
     except Exception as exc:
         print(f"  reset_pose failed: {exc}")
