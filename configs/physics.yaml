@@ -41,6 +41,30 @@ substeps:
 
 
 # ============================================================================
+# REGOLITH SOIL MODEL (System 2.2)
+# ============================================================================
+
+regolith:
+  # Genesis MPM (Material Point Method) high-fidelity soil bed.
+  #
+  # OFF BY DEFAULT. The deterministic analytic Bekker-Wong rut field is
+  # ALWAYS active and is the authoritative, replay-deterministic data product
+  # feeding the wheel/cable models — it does not require this flag or a GPU.
+  #
+  # Enabling the MPM bed is expensive and opt-in:
+  #   * Requires a CUDA backend (gpu_backend.enabled: true).
+  #   * Requires substeps.count >= 14 at timestep 1/240 (CFL stability:
+  #     substep_dt = timestep/substeps must be < 2e-2 * dx). With the default
+  #     substeps.count: 2 the build fails fast with an actionable error rather
+  #     than producing an unstable bed — it is never silently downgraded.
+  #   * MPM scenes run ~10x slower than rigid-only scenes.
+  #
+  # Leave false for normal rover/terrain simulation. Set true only for
+  # high-fidelity soil-deformation studies on a GPU box with substeps raised.
+  mpm_enabled: false
+
+
+# ============================================================================
 # COLLISION DETECTION AND RESPONSE
 # ============================================================================
 

@@ -22,6 +22,12 @@ from moon_rover.rover.drive.lunar_wheel_terrain import (
     LunarRegolithWheelTerrain,
     default_lunar_regolith_config,
 )
+from moon_rover.rover.drive.terramechanics import (
+    AnalyticTerramechanics,
+    TerramechanicsWheelState,
+    default_analytic_terramechanics,
+    flat_regolith_terrain,
+)
 
 __all__ = [
     "DriveCommand",
@@ -38,4 +44,8 @@ __all__ = [
     "WheelTerrainModel",
     "LunarRegolithWheelTerrain",
     "default_lunar_regolith_config",
+    "AnalyticTerramechanics",
+    "TerramechanicsWheelState",
+    "default_analytic_terramechanics",
+    "flat_regolith_terrain",
 ]

@@ -29,6 +29,13 @@ class RegolithConfig:
         friction_angle_deg: Internal friction angle in degrees (35-40 for lunar regolith).
         cohesion_kpa: Cohesion in kPa (0.5 typical for loose lunar soil).
         constitutive_model: Soil model ("drucker_prager", "cam_clay", "mcc").
+        mpm_enabled: Opt-in switch for the Genesis MPM soil bed. Default
+            ``False`` — the deterministic analytic Bekker-Wong rut field is
+            always active and is the authoritative data product. When ``True``
+            the high-fidelity MPM granular bed is also built; this requires a
+            CUDA backend and a sufficiently small substep (CFL: substeps >= 14
+            at timestep 1/240), making MPM scenes ~10x slower than rigid scenes.
+            The bed is never enabled implicitly.
     """
     particle_resolution_near: float = 0.02
     particle_resolution_far: float = 0.10
@@ -37,6 +44,7 @@ class RegolithConfig:
     friction_angle_deg: float = 37.5
     cohesion_kpa: float = 0.5
     constitutive_model: str = "drucker_prager"
+    mpm_enabled: bool = False
 
 
 class RegolithSimulation(ABC):

@@ -85,6 +85,23 @@ The backlog for this project is managed in the waterfree todo mcp.  use this hea
 - `viewer:cpu:rover-proxy`: min `render_rate_hz=15`, max `frame_interval_jitter_s=0.20`, max `build_seconds=300`, max `teardown_seconds=15`.
 - `viewer:gpu:rover-proxy`: min `render_rate_hz=15`, max `frame_interval_jitter_s=0.20`, max `build_seconds=600`, max `teardown_seconds=15`.
 
+### Regolith interaction tiers (two-tier model)
+
+There are two wheel/regolith interaction tiers. **Tier 1 is the canonical default**; Tier 2 is opt-in.
+
+- **Tier 1 — rigid + analytic terramechanics (DEFAULT, GPU-free).** Module: `moon_rover.rover.drive.terramechanics`. One-call entry point: `default_analytic_terramechanics(...)` → `AnalyticTerramechanics`. It composes the engine's regolith-tuned rigid heightfield terrain (rho=1800, friction=1.2, coup_restitution=0.02) as the contact surface, `LunarRegolithWheelTerrain` for kinematic slip + Pacejka traction + Bekker-Wong sinkage + cable-drag degradation, and `GenesisMPMRegolith(engine=None)`'s analytic core for deterministic rut accumulation (repeated-pass compaction) and cable soil drag — wired in as the wheel model's `rut_sampler`. No CUDA, no MPM solver entity, runs at normal substeps (e.g. `substeps=2`), CPU bit-deterministic on replay. Covered by `tests/integration/test_default_terramechanics.py`. This is what normal sim / RL / replay should use.
+- **Tier 2 — Genesis MPM particle soil bed (opt-in).** True granular MPM substrate under the wheels. Enable via `RegolithConfig.mpm_enabled=True` (see below). Requires CUDA + `substeps>=14`; ~10x slower than Tier 1.
+- **Accuracy vs runtime.** Tier 1 captures slip-traction coupling, load-dependent sinkage, and multi-pass rut compaction analytically (no true granular flow, lateral berm formation, or particle-scale soil failure). It is the right model for trafficability, path-following, energy/odometry, and RL where ~real-time and determinism matter. Tier 2 adds genuine granular deformation at ~10x cost and a CUDA dependency. **Escalate to Tier 2 only** for high-fidelity soil-deformation studies (deep sinkage/entrapment, excavation, berm/scour geometry) where the analytic rut field is insufficient — not for routine driving, navigation, or RL rollouts.
+
+### Regolith MPM soil bed (opt-in, default OFF)
+
+- The Genesis MPM regolith bed is **disabled by default**. The switch is `RegolithConfig.mpm_enabled` (surfaced as `regolith.mpm_enabled` in `configs/physics.yaml`), default `False`.
+- With the default config, `GenesisMPMRegolith` runs analytic-only: no MPM solver entity is created even if an engine is passed. The deterministic Bekker-Wong rut field still feeds `LunarRegolithWheelTerrain` via its `rut_sampler` (`get_sinkage_at`) — that analytic field is the authoritative, replay-deterministic data product regardless of this flag.
+- When `mpm_enabled=True`, the MPM bed is built and the config MUST satisfy the CFL substep gate: `substep_dt = timestep / substeps` must be `< 2e-2 * dx` (`dx=1/64`). At the default timestep `1/240` this requires `substeps >= 14` (use ~20 for transient margin). If it does not, the build fails fast with an actionable `RuntimeError` — never a silent downgrade to a smaller substep or to analytic-only.
+- `mpm_enabled=True` with no engine supplied is a misconfiguration and raises `RuntimeError`, not an implicit analytic fallback.
+- Perf/accuracy tradeoff: the MPM bed requires a CUDA backend plus the raised substep count, making MPM scenes ~10x slower than rigid-only scenes. Enable only for high-fidelity soil-deformation studies.
+- No regolith scene composer exists yet; when one is added it should read `regolith.mpm_enabled` to decide whether to pass `engine=` to `GenesisMPMRegolith`.
+
 ### Known limitations
 
 - The real Genesis smoke suite is intentionally CPU/no-viewer so it stays stable on the local Windows setup.
