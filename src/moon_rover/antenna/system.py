@@ -166,3 +166,178 @@ class AntennaUnit(ABC):
             - "mast_length_m": Current mast extension length (increases during DEPLOYED state).
         """
         raise NotImplementedError
+
+
+# Allowed state-machine edges. FAILED is reachable from any non-terminal state
+# (handled separately) to model mechanical faults at any point.
+_ANTENNA_TRANSITIONS: dict[AntennaState, set[AntennaState]] = {
+    AntennaState.STORED: {AntennaState.GRIPPED},
+    AntennaState.GRIPPED: {AntennaState.CARRIED, AntennaState.STORED},
+    AntennaState.CARRIED: {AntennaState.PLACED, AntennaState.GRIPPED},
+    AntennaState.PLACED: {AntennaState.DEPLOYED, AntennaState.GRIPPED},
+    AntennaState.DEPLOYED: {AntennaState.ACTIVE},
+    AntennaState.ACTIVE: set(),
+    AntennaState.FAILED: set(),
+}
+
+
+class DeployableAntennaUnit(AntennaUnit):
+    """Mast-mounted dish antenna with a 7-state deployment machine.
+
+    Lifecycle: ``STORED → GRIPPED → CARRIED → PLACED → DEPLOYED → ACTIVE``,
+    with ``FAILED`` reachable from any non-terminal state. Transitions are
+    guarded: placing requires a known ground pose (:meth:`set_placement`),
+    ``PLACED → DEPLOYED`` raises the mast to full height, and
+    ``DEPLOYED → ACTIVE`` requires a non-failed deployment assessment with the
+    RF connector engaged. Once ``ACTIVE`` the unit exposes a
+    :class:`~moon_rover.sensors.gps_beacon.network.BeaconConfig` so it can join
+    the pseudo-GNSS network.
+
+    The ``engine`` argument is optional and only used for a terrain-height
+    lookup at the placement site; the model is otherwise deterministic.
+    """
+
+    def __init__(self, config: AntennaConfig, engine: Any = None) -> None:
+        self._config = config
+        self._engine = engine
+        self._state = AntennaState.STORED
+        self._placement_xy: NDArray | None = None
+        self._base_z: float = 0.0
+        self._tilt_deg: float = 0.0
+        self._base_contact_corners: int = 0
+        self._position_error_m: float = 0.0
+        self._connector_engaged: bool = False
+        self._mast_length_m: float = 0.0
+        self._beacon_range_m: float = 800.0
+        self._beacon_power_w: float = 20.0
+        self._beacon_noise_sigma_m: float = 0.5
+
+    # -- external sensing hooks ---------------------------------------
+    def set_placement(
+        self,
+        position_xy: NDArray,
+        tilt_deg: float,
+        base_contact_corners: int,
+        position_error_m: float,
+        connector_engaged: bool = False,
+    ) -> None:
+        """Record the sensed ground placement used for quality assessment."""
+        self._placement_xy = np.asarray(position_xy, dtype=np.float64).reshape(2)
+        eng = self._engine
+        if eng is not None and hasattr(eng, "get_terrain_height"):
+            try:
+                self._base_z = float(
+                    eng.get_terrain_height(
+                        self._placement_xy[0], self._placement_xy[1]
+                    )
+                )
+            except Exception:
+                self._base_z = 0.0
+        self._tilt_deg = float(tilt_deg)
+        self._base_contact_corners = int(np.clip(base_contact_corners, 0, 4))
+        self._position_error_m = float(position_error_m)
+        self._connector_engaged = bool(connector_engaged)
+
+    def set_connector_engaged(self, engaged: bool) -> None:
+        self._connector_engaged = bool(engaged)
+
+    def fail(self) -> None:
+        """Force the unit into the terminal FAILED state."""
+        self._state = AntennaState.FAILED
+
+    # -- state machine -------------------------------------------------
+    def get_state(self) -> AntennaState:
+        return self._state
+
+    def transition(self, new_state: AntennaState) -> bool:
+        if new_state == self._state:
+            return True
+        if self._state in (AntennaState.ACTIVE, AntennaState.FAILED):
+            # Terminal-ish: only ACTIVE -> FAILED is allowed.
+            if self._state == AntennaState.ACTIVE and new_state == AntennaState.FAILED:
+                self._state = AntennaState.FAILED
+                return True
+            return False
+        if new_state == AntennaState.FAILED:
+            self._state = AntennaState.FAILED
+            return True
+        if new_state not in _ANTENNA_TRANSITIONS[self._state]:
+            return False
+
+        # Precondition gates.
+        if new_state == AntennaState.PLACED and self._placement_xy is None:
+            return False
+        if new_state == AntennaState.ACTIVE:
+            q = self.evaluate_deployment()
+            if q.status == "failed" or not self._connector_engaged:
+                return False
+
+        self._state = new_state
+        if new_state == AntennaState.DEPLOYED:
+            self._mast_length_m = self._config.mast_height_m
+        elif new_state in (AntennaState.STORED, AntennaState.GRIPPED):
+            self._mast_length_m = 0.0
+        return True
+
+    # -- assessment ----------------------------------------------------
+    def evaluate_deployment(self) -> DeploymentQuality:
+        tilt = self._tilt_deg
+        corners = self._base_contact_corners
+        engaged = self._connector_engaged
+        if tilt > 8.0 or corners < 2:
+            status = "failed"
+        elif tilt <= 5.0 and corners >= 4 and engaged:
+            status = "full"
+        else:
+            status = "degraded"
+        return DeploymentQuality(
+            tilt_deg=tilt,
+            base_contact_corners=corners,
+            position_error_m=self._position_error_m,
+            connector_engaged=engaged,
+            status=status,
+        )
+
+    def get_beacon_config(self) -> Any | None:
+        if self._state != AntennaState.ACTIVE or self._placement_xy is None:
+            return None
+        if self.evaluate_deployment().status == "failed":
+            return None
+        from moon_rover.sensors.gps_beacon.network import BeaconConfig
+
+        pos = np.array(
+            [
+                self._placement_xy[0],
+                self._placement_xy[1],
+                self._base_z + self._mast_length_m,
+            ],
+            dtype=np.float64,
+        )
+        return BeaconConfig(
+            position_xyz=pos,
+            signal_range_m=self._beacon_range_m,
+            power_w=self._beacon_power_w,
+            noise_sigma_m=self._beacon_noise_sigma_m,
+        )
+
+    def get_physical_properties(self) -> dict[str, Any]:
+        cfg = self._config
+        if self._placement_xy is not None:
+            base = np.array(
+                [self._placement_xy[0], self._placement_xy[1], self._base_z]
+            )
+        else:
+            base = np.zeros(3)
+        com = base + np.array([0.0, 0.0, max(self._mast_length_m, 0.0) * 0.5])
+        footprint = cfg.base_plate_m[0] * cfg.base_plate_m[1]
+        return {
+            "mass_kg": cfg.total_mass_kg,
+            "dimensions_m": [
+                list(cfg.base_plate_m),
+                cfg.mast_height_m,
+                cfg.dish_diameter_m,
+            ],
+            "center_of_mass": com.astype(np.float64),
+            "footprint_area_m2": float(footprint),
+            "mast_length_m": float(self._mast_length_m),
+        }

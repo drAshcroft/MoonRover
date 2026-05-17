@@ -68,10 +68,28 @@ from moon_rover.core.physics.engine import GenesisConfig  # noqa: E402
 from moon_rover.core.physics._genesis_engine import GenesisPhysicsEngine  # noqa: E402
 from moon_rover.core.scene.rover_composer import RoverComposer  # noqa: E402
 from moon_rover.core.assets.urdf_builder import GenesisURDFBuilder  # noqa: E402
+from moon_rover.antenna import (  # noqa: E402
+    AntennaConfig,
+    AntennaState,
+    DeployableAntennaUnit,
+)
+from moon_rover.cable import CableConfig, RigidLinkCableSystem  # noqa: E402
+from moon_rover.environment.lighting import LunarSolarSystem, SolarConfig  # noqa: E402
+from moon_rover.environment.terrain import (  # noqa: E402
+    LunarTerrainGenerator,
+    TerrainConfig,
+)
+from moon_rover.environment.thermal import (  # noqa: E402
+    ComponentThermal,
+    LunarThermalModel,
+    ThermalConfig,
+)
+from moon_rover.moonbase import LunarMoonbase, MoonbaseConfig  # noqa: E402
 from moon_rover.rover.drive import (  # noqa: E402
     DriveCommand,
     DriveType,
     create_drive_system,
+    default_analytic_terramechanics,
     drive_config_from_profile,
 )
 from moon_rover.rover.manipulator.arm import ArmConfig, GripperConfig  # noqa: E402
@@ -79,6 +97,22 @@ from moon_rover.rover.manipulator.serial_arm import SerialArm  # noqa: E402
 from moon_rover.rover.power import (  # noqa: E402
     RoverPowerSystem,
     power_config_from_yaml,
+)
+from moon_rover.sensors import (  # noqa: E402
+    BeaconConfig,
+    CameraConfig,
+    EncoderConfig,
+    FTConfig,
+    GenesisForceTorqueSensor,
+    GenesisIMUSensor,
+    GenesisLiDARScanner,
+    GenesisSunSensor,
+    GenesisWheelEncoder,
+    IMUConfig,
+    LiDARConfig,
+    RaycastStereoCamera,
+    SunSensorConfig,
+    TrilaterationBeaconNetwork,
 )
 
 ROVER_NAME = "demo_rover"
@@ -119,6 +153,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self-test", action="store_true",
                         help="Inject a scripted drive+arm command sequence "
                              "(no keyboard) to verify balance under motion.")
+    parser.add_argument("--capability-demo", action="store_true",
+                        help="Layer current subsystem telemetry onto the "
+                             "2-wheel balance bot demo.")
     return parser.parse_args()
 
 
@@ -127,9 +164,13 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def load_rover_yaml(path: Path) -> dict:
+def load_yaml(path: Path) -> dict:
     with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def load_rover_yaml(path: Path) -> dict:
+    return load_yaml(path)
 
 
 def build_rover_urdf(rover_cfg: dict, profile_name: str) -> str:
@@ -548,6 +589,637 @@ class WheelTorqueActuator:
 
 
 # ---------------------------------------------------------------------------
+# Current-capabilities showcase layer
+# ---------------------------------------------------------------------------
+
+
+class CapabilityTerrainScene:
+    """Small heightfield scene for the analytic sensor showcase."""
+
+    def __init__(self, terrain_output, terrain_size_m: float) -> None:
+        self._terrain = terrain_output
+        self._size = float(terrain_size_m)
+        self._height = np.asarray(terrain_output.height_field, dtype=np.float64)
+        self._normals = np.asarray(terrain_output.normal_map, dtype=np.float64)
+        self._res = int(self._height.shape[0])
+
+    def get_terrain_height(self, x: float, y: float) -> float:
+        x = float(np.clip(x, 0.0, self._size))
+        y = float(np.clip(y, 0.0, self._size))
+        gx = x / self._size * (self._res - 1) if self._size > 0.0 else 0.0
+        gy = y / self._size * (self._res - 1) if self._size > 0.0 else 0.0
+        j0 = int(np.clip(math.floor(gx), 0, self._res - 1))
+        i0 = int(np.clip(math.floor(gy), 0, self._res - 1))
+        j1 = min(j0 + 1, self._res - 1)
+        i1 = min(i0 + 1, self._res - 1)
+        tx = gx - j0
+        ty = gy - i0
+        top = self._height[i0, j0] * (1.0 - tx) + self._height[i0, j1] * tx
+        bot = self._height[i1, j0] * (1.0 - tx) + self._height[i1, j1] * tx
+        return float(top * (1.0 - ty) + bot * ty)
+
+    def get_terrain_normal(self, x: float, y: float) -> np.ndarray:
+        x = float(np.clip(x, 0.0, self._size))
+        y = float(np.clip(y, 0.0, self._size))
+        j = int(np.clip(round(x / self._size * (self._res - 1)), 0, self._res - 1))
+        i = int(np.clip(round(y / self._size * (self._res - 1)), 0, self._res - 1))
+        n = self._normals[i, j]
+        mag = float(np.linalg.norm(n))
+        return n / mag if mag > 1e-9 else np.array([0.0, 0.0, 1.0])
+
+    def raycast_batch(
+        self, origins: np.ndarray, directions: np.ndarray, max_range: float
+    ) -> dict[str, np.ndarray]:
+        """Fast terrain hit test for the demo sensors.
+
+        The production sensors can fall back to exact heightfield marching, but
+        that is intentionally conservative and too slow for this telemetry
+        overlay. Here we intersect each ray against the local terrain surface,
+        then do one height correction at the estimated hit point.
+        """
+        origins = np.asarray(origins, dtype=np.float64).reshape(-1, 3)
+        directions = np.asarray(directions, dtype=np.float64).reshape(-1, 3)
+        norms = np.linalg.norm(directions, axis=1, keepdims=True)
+        directions = directions / np.maximum(norms, 1e-12)
+        n = origins.shape[0]
+
+        distances = np.full(n, np.inf, dtype=np.float64)
+        positions = np.full((n, 3), np.nan, dtype=np.float64)
+        normals = np.zeros((n, 3), dtype=np.float64)
+        dz = directions[:, 2]
+        downward = dz < -1e-6
+        if not np.any(downward):
+            return {
+                "distances": distances,
+                "positions": positions,
+                "normals": normals,
+                "hit": np.zeros(n, dtype=bool),
+            }
+
+        idx = np.where(downward)[0]
+        h0 = np.array(
+            [self.get_terrain_height(origins[i, 0], origins[i, 1]) for i in idx],
+            dtype=np.float64,
+        )
+        t = (h0 - origins[idx, 2]) / dz[idx]
+        p = origins[idx] + directions[idx] * t[:, None]
+        h1 = np.array(
+            [self.get_terrain_height(p[k, 0], p[k, 1]) for k in range(p.shape[0])],
+            dtype=np.float64,
+        )
+        t = (h1 - origins[idx, 2]) / dz[idx]
+        hit = (t > 0.0) & (t <= max_range)
+        hit_idx = idx[hit]
+        if hit_idx.size:
+            distances[hit_idx] = t[hit]
+            positions[hit_idx] = origins[hit_idx] + directions[hit_idx] * t[hit, None]
+            positions[hit_idx, 2] = h1[hit]
+            for j in hit_idx:
+                normals[j] = self.get_terrain_normal(positions[j, 0], positions[j, 1])
+        return {
+            "distances": distances,
+            "positions": positions,
+            "normals": normals,
+            "hit": np.isfinite(distances),
+        }
+
+
+class CapabilityShowcase:
+    """Low-rate subsystem telemetry layered onto the balance-bot physics run."""
+
+    def __init__(self, args: argparse.Namespace, rover_yaml: dict, profile: dict) -> None:
+        self._args = args
+        self._profile = profile
+        self._terrain_size_m = 32.0
+        self._terrain_origin = np.array([6.0, 6.0, 0.0], dtype=np.float64)
+        self._last_sensor_t = -1.0e9
+        self._last_report_t = -1.0e9
+        self._last_soil_t = -1.0e9
+        self._sensor_period_s = 1.0
+        self._report_period_s = 1.0
+        self._soil_period_s = 0.25
+        self._path_length_m = 0.0
+        self._prev_body_v = 0.0
+        self._antenna_phase = 0
+        self._antenna_registered = False
+
+        terrain_cfg = TerrainConfig(
+            seed=12345,
+            size_m=self._terrain_size_m,
+            fBm_octaves=4,
+            fBm_amplitude=0.35,
+            crater_params={
+                "count": 6,
+                "min_radius_m": 0.5,
+                "max_radius_m": 2.0,
+                "depth_ratio": 0.25,
+            },
+            rock_density=0.012,
+            rille_enabled=True,
+            moonbase_position=(6.0, 6.0, 0.0),
+            resolution=64,
+        )
+        self._terrain = LunarTerrainGenerator(
+            max_traversable_slope_deg=25.0,
+            rock_clearance_m=0.35,
+            moonbase_pad_radius_m=2.0,
+        ).generate(terrain_cfg)
+        self._scene = CapabilityTerrainScene(self._terrain, self._terrain_size_m)
+        self._nav_pct = 100.0 * float(np.mean(self._terrain.nav_mesh > 0))
+
+        self._solar = LunarSolarSystem(
+            terrain_size_m=self._terrain_size_m,
+            terrain_normal_map=self._terrain.normal_map,
+        )
+        self._solar.configure(
+            SolarConfig(
+                elevation_deg=float(np.clip(args.sun_elevation_deg, 0.0, 90.0)),
+                azimuth_deg=135.0,
+                lunar_day_cycle=False,
+            )
+        )
+
+        self._thermal = LunarThermalModel()
+        self._thermal.initialize(
+            ThermalConfig(
+                component_models={
+                    "battery_main": ComponentThermal(
+                        operating_range=(0.0, 45.0),
+                        survival_range=(-20.0, 60.0),
+                        thermal_mass=14000.0,
+                        heat_generation=8.0,
+                        radiative_area=0.18,
+                        current_temp=20.0,
+                    ),
+                    "motor_pair": ComponentThermal(
+                        operating_range=(-40.0, 80.0),
+                        survival_range=(-60.0, 125.0),
+                        thermal_mass=4500.0,
+                        heat_generation=24.0,
+                        radiative_area=0.22,
+                        current_temp=20.0,
+                    ),
+                }
+            )
+        )
+
+        self._lidar = GenesisLiDARScanner()
+        self._lidar.configure(
+            LiDARConfig(
+                num_channels=6,
+                h_resolution_deg=20.0,
+                elevation_range_deg=(-25.0, 10.0),
+                max_range_m=12.0,
+                range_noise_sigma_m=0.01,
+                intensity_noise_sigma=0.02,
+                rotation_rate_hz=10.0,
+                min_range_m=0.25,
+                max_returns=1,
+                dropout_probability=0.02,
+                seed=11,
+            )
+        )
+        self._camera = RaycastStereoCamera()
+        self._camera.configure(
+            CameraConfig(
+                resolution=(40, 30),
+                baseline_m=0.12,
+                fov_h_deg=60.0,
+                fov_v_deg=45.0,
+                focal_length_px=38.0,
+                frame_rate_hz=10.0,
+                depth_range_m=(0.25, 12.0),
+                depth_noise_sigma=0.02,
+                seed=12,
+            )
+        )
+        self._imu = GenesisIMUSensor()
+        self._imu.configure(
+            IMUConfig(
+                update_rate_hz=max(float(args.sim_hz), 1.0),
+                gyro_noise_sigma=0.002,
+                accel_noise_sigma=0.03,
+                gyro_bias_drift_deg_hr=0.5,
+                seed=13,
+            )
+        )
+        self._encoder = GenesisWheelEncoder()
+        self._encoder.configure(
+            EncoderConfig(
+                counts_per_rev=2048,
+                update_rate_hz=max(float(args.sim_hz), 1.0),
+                seed=14,
+            )
+        )
+        self._sun_sensor = GenesisSunSensor()
+        self._sun_sensor.configure(
+            SunSensorConfig(accuracy_deg=0.5, update_rate_hz=1.0, seed=15)
+        )
+        self._force_torque = GenesisForceTorqueSensor()
+        self._force_torque.configure(
+            FTConfig(
+                force_range_n=500.0,
+                torque_range_nm=50.0,
+                resolution_force=0.1,
+                resolution_torque=0.01,
+                update_rate_hz=50.0,
+                seed=16,
+            )
+        )
+
+        self._moonbase = LunarMoonbase()
+        self._moonbase.initialize(
+            MoonbaseConfig(
+                habitat_dims_m=(4.0, 3.0, 2.5),
+                solar_array_config=None,
+                power_bus_voltage=48.0,
+                comm_tower_height_m=6.0,
+                num_docking_bays=2,
+                charge_rate_w=500.0,
+                num_cable_reels=3,
+                num_antennas=6,
+                landing_pad_radius_m=8.0,
+            ),
+            self._scene,
+        )
+        self._moonbase.request_cable_reel(ROVER_NAME)
+        self._moonbase.request_antenna(ROVER_NAME)
+        self._moonbase.request_antenna(ROVER_NAME)
+
+        self._beacons = TrilaterationBeaconNetwork(seed=17)
+        self._beacons.add_beacon("moonbase_primary", self._moonbase.get_primary_beacon())
+        for beacon_id, xyz in {
+            "pad_north": (6.0, 12.0, 1.0),
+            "pad_south": (6.0, 0.0, 1.0),
+            "pad_east": (12.0, 6.0, 1.0),
+            "pad_west": (0.0, 6.0, 1.0),
+            "pad_high": (10.0, 10.0, 7.0),
+        }.items():
+            self._beacons.add_beacon(
+                beacon_id,
+                BeaconConfig(
+                    position_xyz=np.array(xyz, dtype=np.float64),
+                    signal_range_m=80.0,
+                    power_w=12.0,
+                    noise_sigma_m=0.08,
+                ),
+            )
+
+        mission_cable = (load_yaml(_PROJECT_ROOT / "configs" / "mission.yaml")).get(
+            "cable", {}
+        )
+        cable_len = float(mission_cable.get("length_m", 60.0))
+        cable_diam = float(mission_cable.get("diameter_mm", 10.0)) / 1000.0
+        self._cable_link_m = 1.0
+        self._cable = RigidLinkCableSystem()
+        self._cable.initialize(
+            CableConfig(
+                link_length_m=self._cable_link_m,
+                link_diameter_m=cable_diam,
+                link_mass_kg=float(mission_cable.get("linear_density_kg_m", 0.15)),
+                total_length_m=min(cable_len, 40.0),
+                joint_damping=0.4,
+                joint_stiffness=80.0,
+                terrain_friction=0.55,
+                max_tension_n=float(mission_cable.get("max_tension_n", 500.0)),
+                bend_radius_min_m=0.12,
+                voltage_dc=48.0,
+                resistance_per_m=float(
+                    mission_cable.get("power", {}).get("resistance_per_m_ohms", 0.005)
+                ),
+            ),
+            self._scene,
+        )
+
+        self._antenna_cfg = AntennaConfig(
+            base_plate_m=(0.45, 0.45, 0.08),
+            base_mass_kg=2.0,
+            mast_height_m=2.5,
+            mast_radius_m=0.035,
+            mast_mass_kg=1.2,
+            dish_diameter_m=0.75,
+            dish_mass_kg=1.0,
+            connector_mass_kg=0.3,
+            total_mass_kg=4.5,
+        )
+        self._antenna = DeployableAntennaUnit(self._antenna_cfg, self._scene)
+
+        self._terramechanics = default_analytic_terramechanics(
+            terrain=self._terrain,
+            terrain_size_m=self._terrain_size_m,
+            wheel_radius_m=float(profile["wheel_radius_m"]),
+            wheel_width_m=0.08,
+        )
+
+        self._lidar_points = 0
+        self._depth_valid_pct = 0.0
+        self._gps_error_m = float("inf")
+        self._gdop = float("inf")
+        self._visible_beacons = 0
+        self._rut_depth_m = 0.0
+        self._traction_scale = 1.0
+        self._imu_yaw_rate = 0.0
+        self._encoder_left = 0
+        self._ft_force_n = 0.0
+        self._sun_valid = False
+
+    def print_initial_status(self) -> None:
+        inv = self._moonbase.get_inventory()
+        print("-" * 92)
+        print("  Capability demo: terrain/regolith, sensors, cable, antenna, moonbase, power/thermal")
+        print(
+            f"  Terrain     : {self._terrain_size_m:.0f} m field, "
+            f"{len(self._terrain.crater_list)} craters, "
+            f"{len(self._terrain.rock_positions)} rocks, "
+            f"{self._nav_pct:.1f}% nav cells"
+        )
+        print(
+            f"  Moonbase    : primary beacon online, depot assigned "
+            f"{len(inv.assigned_items.get(ROVER_NAME, []))} items to rover"
+        )
+        print("-" * 92)
+
+    @property
+    def sun_elevation_deg(self) -> float:
+        return float(np.clip(self._solar.get_sun_elevation_deg(), 0.0, 90.0))
+
+    def pre_power_step(self, sim_t: float, dt: float, power: RoverPowerSystem) -> None:
+        self._solar.update(max(0.0, sim_t))
+        self._thermal.step(dt, self.sun_elevation_deg)
+        power.set_battery_temperature(
+            self._thermal.get_component_temp("battery_main")
+        )
+
+    def subsystem_states(self, driving: bool) -> dict[str, str]:
+        active = "active"
+        idle = "idle"
+        return {
+            "drive_motors": active if driving else idle,
+            "compute": active,
+            "comms": active,
+            "cameras": active,
+            "lidar": active,
+            "imu": active,
+            "manipulator": active,
+            "heating": idle,
+        }
+
+    def post_physics_step(
+        self,
+        *,
+        engine: GenesisPhysicsEngine,
+        wheel_actuator: WheelTorqueActuator,
+        power_state,
+        sim_t: float,
+        dt: float,
+        body_v: float,
+        yaw_rate: float,
+        roll: float,
+        pitch: float,
+        yaw: float,
+        driving: bool,
+    ) -> None:
+        terrain_pos, sensor_pose = self._terrain_pose(engine)
+        wheel_omega = wheel_actuator.wheel_omega()
+
+        self._path_length_m += abs(body_v) * max(dt, 0.0)
+        self._update_cable(terrain_pos, dt, abs(body_v), power_state)
+        self._update_antenna(sim_t, terrain_pos)
+
+        if sim_t - self._last_soil_t >= self._soil_period_s:
+            self._last_soil_t = sim_t
+            self._update_terramechanics(terrain_pos, body_v, wheel_omega)
+
+        if sim_t - self._last_sensor_t >= self._sensor_period_s:
+            self._last_sensor_t = sim_t
+            self._sample_sensors(
+                terrain_pos,
+                sensor_pose,
+                wheel_omega,
+                body_v,
+                yaw_rate,
+                roll,
+                pitch,
+                yaw,
+                driving,
+                dt,
+            )
+
+        if sim_t - self._last_report_t >= self._report_period_s:
+            self._last_report_t = sim_t
+            self._print_status(power_state)
+
+    def _terrain_pose(
+        self, engine: GenesisPhysicsEngine
+    ) -> tuple[np.ndarray, np.ndarray]:
+        pos, quat = engine.get_body_pose(ROVER_NAME)
+        pos_arr = np.asarray(pos, dtype=np.float64).reshape(3)
+        quat_arr = np.asarray(quat, dtype=np.float64).reshape(4)
+        mapped_xy = self._terrain_origin[:2] + pos_arr[:2]
+        ground_z = self._scene.get_terrain_height(mapped_xy[0], mapped_xy[1])
+        terrain_pos = np.array([mapped_xy[0], mapped_xy[1], ground_z], dtype=np.float64)
+        sensor_pose = np.array(
+            [
+                terrain_pos[0],
+                terrain_pos[1],
+                ground_z + 0.75,
+                quat_arr[0],
+                quat_arr[1],
+                quat_arr[2],
+                quat_arr[3],
+            ],
+            dtype=np.float64,
+        )
+        return terrain_pos, sensor_pose
+
+    def _update_cable(
+        self,
+        terrain_pos: np.ndarray,
+        dt: float,
+        speed_mps: float,
+        power_state,
+    ) -> None:
+        states = self._cable.get_link_states()
+        active = sum(1 for link in states if link.active)
+        target_active = min(
+            len(states),
+            int(self._path_length_m / self._cable_link_m) + 1,
+        )
+        while active < target_active:
+            if not self._cable.activate_next_link(terrain_pos):
+                break
+            active += 1
+        self._cable.command_spool(speed_mps if speed_mps > 0.02 else 0.0)
+        if hasattr(self._cable, "set_electrical_load"):
+            current = max(0.0, float(power_state.total_draw_w)) / 48.0
+            self._cable.set_electrical_load(current)
+        self._cable.step(dt)
+
+    def _update_antenna(self, sim_t: float, terrain_pos: np.ndarray) -> None:
+        if self._antenna_phase == 0 and sim_t >= 2.0:
+            self._antenna.transition(AntennaState.GRIPPED)
+            self._antenna_phase = 1
+        elif self._antenna_phase == 1 and sim_t >= 3.0:
+            self._antenna.transition(AntennaState.CARRIED)
+            self._antenna_phase = 2
+        elif self._antenna_phase == 2 and sim_t >= 4.5:
+            place_xy = terrain_pos[:2] + np.array([1.0, 0.35])
+            self._antenna.set_placement(
+                place_xy,
+                tilt_deg=2.0,
+                base_contact_corners=4,
+                position_error_m=0.12,
+                connector_engaged=False,
+            )
+            self._antenna.transition(AntennaState.PLACED)
+            self._antenna_phase = 3
+        elif self._antenna_phase == 3 and sim_t >= 5.5:
+            self._antenna.transition(AntennaState.DEPLOYED)
+            self._antenna_phase = 4
+        elif self._antenna_phase == 4 and sim_t >= 6.5:
+            self._antenna.set_connector_engaged(True)
+            self._antenna.transition(AntennaState.ACTIVE)
+            self._antenna_phase = 5
+
+        if (
+            self._antenna.get_state() is AntennaState.ACTIVE
+            and not self._antenna_registered
+        ):
+            beacon = self._antenna.get_beacon_config()
+            if beacon is not None:
+                self._beacons.add_beacon("deployed_antenna_1", beacon)
+                self._antenna_registered = True
+
+    def _update_terramechanics(
+        self,
+        terrain_pos: np.ndarray,
+        body_v: float,
+        wheel_omega: tuple[float, float],
+    ) -> None:
+        track = float(self._profile["track_width_m"])
+        radius = float(self._profile["wheel_radius_m"])
+        mass = float(self._profile.get("mass_kg", 20.0)) + self._antenna_cfg.total_mass_kg
+        wheel_load = mass * 1.622 / 2.0
+        cable_tension = self._cable.get_spool_state().tension_n
+        states = []
+        for side, omega in ((1.0, wheel_omega[0]), (-1.0, wheel_omega[1])):
+            contact = terrain_pos + np.array([0.0, side * track * 0.5, 0.0])
+            contact[0] = float(np.clip(contact[0], 0.0, self._terrain_size_m))
+            contact[1] = float(np.clip(contact[1], 0.0, self._terrain_size_m))
+            states.append(
+                self._terramechanics.update_wheel(
+                    contact,
+                    wheel_angular_vel=omega,
+                    ground_velocity=abs(body_v),
+                    wheel_load_n=wheel_load,
+                    contact_radius_m=max(0.04, radius * 0.35),
+                    cable_tension_n=cable_tension,
+                )
+            )
+        self._rut_depth_m = max(s.rut_depth for s in states)
+        self._traction_scale = min(s.traction_scale for s in states)
+
+    def _sample_sensors(
+        self,
+        terrain_pos: np.ndarray,
+        sensor_pose: np.ndarray,
+        wheel_omega: tuple[float, float],
+        body_v: float,
+        yaw_rate: float,
+        roll: float,
+        pitch: float,
+        yaw: float,
+        driving: bool,
+        dt: float,
+    ) -> None:
+        cloud = self._lidar.scan(self._scene, sensor_pose)
+        dust_density = 6.0 if driving else 2.0
+        cloud = self._lidar.apply_dust_interference(dust_density, cloud)
+        self._lidar_points = int(cloud.points.shape[0])
+
+        frame = self._camera.capture(self._scene, sensor_pose)
+        self._depth_valid_pct = 100.0 * float(np.isfinite(frame.depth_map).mean())
+
+        fix = self._beacons.compute_fix(terrain_pos)
+        self._visible_beacons = len(self._beacons.get_visible_beacons(terrain_pos))
+        if fix is None:
+            self._gps_error_m = float("inf")
+            self._gdop = float("inf")
+        else:
+            self._gps_error_m = float(np.linalg.norm(fix.position_xyz - terrain_pos))
+            self._gdop = float(fix.gdop)
+
+        accel_x = (body_v - self._prev_body_v) / dt if dt > 0.0 else 0.0
+        self._prev_body_v = body_v
+        imu = self._imu.read(
+            np.array([accel_x, 0.0, 0.0], dtype=np.float64),
+            np.array([0.0, 0.0, yaw_rate], dtype=np.float64),
+        )
+        self._imu_yaw_rate = float(imu.gyro_xyz[2])
+        enc = self._encoder.read([wheel_omega[0], wheel_omega[1]])
+        self._encoder_left = int(enc.counts[0]) if enc.counts else 0
+
+        sun = self._sun_sensor.read(
+            self._solar.get_sun_azimuth_deg(),
+            self.sun_elevation_deg,
+            in_shadow=False,
+        )
+        self._sun_valid = bool(sun.valid)
+
+        held_load = 0.0
+        if self._antenna.get_state() in (AntennaState.GRIPPED, AntennaState.CARRIED):
+            held_load = self._antenna_cfg.total_mass_kg * 1.622
+        ft = self._force_torque.read(
+            np.array(
+                [
+                    0.2 * abs(math.sin(yaw)),
+                    0.1 * abs(math.sin(roll)),
+                    held_load + 0.2 * abs(math.sin(pitch)),
+                    0.02,
+                    0.01,
+                    0.0,
+                ],
+                dtype=np.float64,
+            )
+        )
+        self._ft_force_n = float(np.linalg.norm(ft.force_xyz))
+
+    def _print_status(self, power_state) -> None:
+        cable_states = self._cable.get_link_states()
+        active_links = sum(1 for link in cable_states if link.active)
+        deployed_m = active_links * self._cable_link_m
+        spool = self._cable.get_spool_state()
+        elec = self._cable.get_electrical_state()
+        ant_state = self._antenna.get_state().value
+        if self._antenna.get_state() in (
+            AntennaState.STORED,
+            AntennaState.GRIPPED,
+            AntennaState.CARRIED,
+        ):
+            ant_quality = "pending"
+        else:
+            ant_quality = self._antenna.evaluate_deployment().status
+        gps = "inf" if not np.isfinite(self._gps_error_m) else f"{self._gps_error_m:.2f}"
+        gdop = "inf" if not np.isfinite(self._gdop) else f"{self._gdop:.1f}"
+        batt_t = self._thermal.get_component_temp("battery_main")
+        motor_t = self._thermal.get_component_temp("motor_pair")
+        print(
+            "  cap | "
+            f"nav={self._nav_pct:4.1f}% rocks={len(self._terrain.rock_positions):02d} | "
+            f"lidar={self._lidar_points:03d} depth={self._depth_valid_pct:4.0f}% "
+            f"gps={gps}m/{gdop} b{self._visible_beacons} | "
+            f"cable={deployed_m:4.1f}m {spool.tension_n:4.1f}N "
+            f"Vdrop={elec['voltage_drop_v']:.2f} | "
+            f"rut={self._rut_depth_m:.3f}m tr={self._traction_scale:.2f} | "
+            f"ant={ant_state}/{ant_quality} | "
+            f"T={batt_t:4.1f}/{motor_t:4.1f}C "
+            f"solar={power_state.solar_output_w:5.1f}W "
+            f"imuZ={self._imu_yaw_rate:+.2f} encL={self._encoder_left} "
+            f"sun={'ok' if self._sun_valid else 'hold'} ft={self._ft_force_n:.1f}N"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Header / telemetry
 # ---------------------------------------------------------------------------
 
@@ -561,6 +1233,8 @@ def print_header(args: argparse.Namespace, profile: dict) -> None:
           f"radius={profile['wheel_radius_m']:.2f} m)")
     print(f"  Chassis     : {profile.get('dimensions', '(from structure)')} m (L,W,H)")
     print(f"  Arm         : visible 4-DOF + parallel-jaw gripper (URDF-emitted)")
+    if args.capability_demo:
+        print("  Capabilities: terrain/regolith, sensors, cable, antenna, moonbase, power/thermal")
     print(f"  Backend     : {args.backend.upper()}  sim @ {args.sim_hz:.0f} Hz")
     print(f"  Viewer      : {'off (headless)' if args.no_viewer else f'on @ {args.render_hz} Hz'}")
     if args.backend == "gpu":
@@ -678,6 +1352,10 @@ def main() -> int:
         solar_cfg, battery_cfg, budget = power_config_from_yaml(power_cfg)
         power = RoverPowerSystem()
         power.initialize(solar_cfg, battery_cfg, budget)
+        capability_demo = None
+        if args.capability_demo:
+            capability_demo = CapabilityShowcase(args, rover_yaml, profile)
+            capability_demo.print_initial_status()
 
         # Software arm: kinematics + grasp bookkeeping; the URDF chain mirrors it.
         arm = SerialArm()
@@ -755,7 +1433,7 @@ def main() -> int:
 
         run_loop(
             engine, drive, wheel_actuator, power, arm, arm_bridge, balance,
-            keyboard, cfg, args, spawn_z,
+            keyboard, cfg, args, spawn_z, capability_demo,
         )
         completed_cleanly = True
 
@@ -791,6 +1469,7 @@ def run_loop(
     cfg: GenesisConfig,
     args: argparse.Namespace,
     spawn_z: float,
+    capability_demo: Optional[CapabilityShowcase] = None,
 ) -> None:
     dt = cfg.timestep
     step_count = 0
@@ -918,19 +1597,41 @@ def run_loop(
 
         # 5. Power accounting.
         driving = abs(v_user) > 0.05 or abs(w_user) > 0.05
-        power.step(
-            dt,
-            sun_elevation=args.sun_elevation_deg,
-            subsystem_states={
-                "mobility": "active" if driving else "idle",
+        if capability_demo is not None:
+            capability_demo.pre_power_step(t, dt, power)
+            subsystem_states = capability_demo.subsystem_states(driving)
+            sun_elevation = capability_demo.sun_elevation_deg
+        else:
+            subsystem_states = {
+                "drive_motors": "active" if driving else "idle",
                 "compute": "active",
-                "communication": "idle",
+                "comms": "idle",
                 "cameras": "idle",
                 "lidar": "idle",
                 "imu": "idle",
                 "manipulator": "active",
-            },
+                "heating": "idle",
+            }
+            sun_elevation = args.sun_elevation_deg
+        power_state = power.step(
+            dt,
+            sun_elevation=sun_elevation,
+            subsystem_states=subsystem_states,
         )
+        if capability_demo is not None:
+            capability_demo.post_physics_step(
+                engine=engine,
+                wheel_actuator=wheel_actuator,
+                power_state=power_state,
+                sim_t=t,
+                dt=dt,
+                body_v=body_v,
+                yaw_rate=yaw_rate,
+                roll=roll,
+                pitch=pitch,
+                yaw=yaw,
+                driving=driving,
+            )
 
         step_count += 1
 

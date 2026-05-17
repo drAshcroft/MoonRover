@@ -29,6 +29,7 @@ class IMUConfig:
     gyro_noise_sigma: float
     accel_noise_sigma: float
     gyro_bias_drift_deg_hr: float
+    seed: int = 0
 
 
 @dataclass
@@ -43,6 +44,7 @@ class EncoderConfig:
 
     counts_per_rev: int
     update_rate_hz: float
+    seed: int = 0
 
 
 @dataclass
@@ -151,3 +153,133 @@ class WheelEncoder(ABC):
             EncoderReading with counts and angular velocities.
         """
         raise NotImplementedError
+
+
+class GenesisIMUSensor(IMUSensor):
+    """Strapdown IMU model: white noise + gyro bias random walk.
+
+    Each :meth:`read` advances one sample period ``dt = 1/update_rate_hz``.
+    The gyroscope bias follows a discrete random walk whose increment standard
+    deviation is derived from the catalog ``gyro_bias_drift_deg_hr`` figure:
+    ``sigma_step = bias_rate_rad_s * sqrt(dt)``. Accelerometer and gyroscope
+    each get zero-mean Gaussian white noise. A single seeded generator keeps
+    runs reproducible for replay.
+    """
+
+    def __init__(self) -> None:
+        self._config: IMUConfig | None = None
+        self._rng: np.random.Generator | None = None
+        self._bias: NDArray = np.zeros(3)
+        self._t: float = 0.0
+        self._dt: float = 0.0
+        self._bias_step_sigma: float = 0.0
+
+    def configure(self, config: IMUConfig) -> None:
+        if config.update_rate_hz <= 0.0:
+            raise ValueError(
+                f"update_rate_hz must be > 0, got {config.update_rate_hz}"
+            )
+        if config.gyro_noise_sigma < 0.0 or config.accel_noise_sigma < 0.0:
+            raise ValueError("noise sigmas must be >= 0")
+        self._config = config
+        self._rng = np.random.default_rng(config.seed)
+        self._bias = np.zeros(3)
+        self._t = 0.0
+        self._dt = 1.0 / config.update_rate_hz
+        # deg/hr -> rad/s, then random-walk increment over one sample.
+        bias_rate_rad_s = np.radians(config.gyro_bias_drift_deg_hr) / 3600.0
+        self._bias_step_sigma = bias_rate_rad_s * np.sqrt(self._dt)
+
+    def read(self, true_accel: NDArray, true_gyro: NDArray) -> IMUReading:
+        if self._config is None or self._rng is None:
+            raise RuntimeError("configure() must be called before read()")
+        rng = self._rng
+        cfg = self._config
+        true_accel = np.asarray(true_accel, dtype=np.float64).reshape(3)
+        true_gyro = np.asarray(true_gyro, dtype=np.float64).reshape(3)
+
+        if self._bias_step_sigma > 0.0:
+            self._bias = self._bias + rng.normal(0.0, self._bias_step_sigma, 3)
+
+        accel = true_accel + rng.normal(0.0, cfg.accel_noise_sigma, 3)
+        gyro = (
+            true_gyro
+            + self._bias
+            + rng.normal(0.0, cfg.gyro_noise_sigma, 3)
+        )
+        self._t += self._dt
+        return IMUReading(
+            accel_xyz=accel,
+            gyro_xyz=gyro,
+            timestamp=self._t,
+        )
+
+    def get_bias_state(self) -> NDArray:
+        return self._bias.copy()
+
+
+class GenesisWheelEncoder(WheelEncoder):
+    """Incremental wheel encoder with tick quantization.
+
+    Integrates each wheel's true angular velocity over one sample period into
+    a fractional revolution accumulator, then reports the truncated integer
+    count at ``counts_per_rev`` resolution. The derived angular velocity comes
+    from the *quantized* count delta divided by ``dt``, so it carries the
+    realistic stair-step quantization error of a real encoder rather than the
+    clean input rate.
+    """
+
+    def __init__(self) -> None:
+        self._config: EncoderConfig | None = None
+        self._dt: float = 0.0
+        self._counts: list[int] = []
+        self._accum: NDArray | None = None  # fractional counts per wheel
+        self._t: float = 0.0
+
+    def configure(self, config: EncoderConfig) -> None:
+        if config.counts_per_rev < 1:
+            raise ValueError(
+                f"counts_per_rev must be >= 1, got {config.counts_per_rev}"
+            )
+        if config.update_rate_hz <= 0.0:
+            raise ValueError(
+                f"update_rate_hz must be > 0, got {config.update_rate_hz}"
+            )
+        self._config = config
+        self._dt = 1.0 / config.update_rate_hz
+        self._counts = []
+        self._accum = None
+        self._t = 0.0
+
+    def read(self, true_angular_velocities: list[float]) -> EncoderReading:
+        if self._config is None:
+            raise RuntimeError("configure() must be called before read()")
+        cfg = self._config
+        omega = np.asarray(true_angular_velocities, dtype=np.float64).reshape(-1)
+        n = omega.shape[0]
+        if self._accum is None:
+            self._accum = np.zeros(n)
+            self._counts = [0] * n
+        elif self._accum.shape[0] != n:
+            raise ValueError(
+                f"wheel count changed: configured for {self._accum.shape[0]}, "
+                f"got {n}"
+            )
+
+        # rev/s -> counts/s: omega/(2pi) * counts_per_rev.
+        delta_counts = omega / (2.0 * np.pi) * cfg.counts_per_rev * self._dt
+        self._accum = self._accum + delta_counts
+        new_counts = np.trunc(self._accum).astype(np.int64)
+        tick_delta = new_counts - np.asarray(self._counts, dtype=np.int64)
+        self._counts = new_counts.tolist()
+
+        # Angular velocity reconstructed from quantized ticks.
+        ang_vel = (
+            tick_delta / cfg.counts_per_rev * 2.0 * np.pi / self._dt
+        ).tolist()
+        self._t += self._dt
+        return EncoderReading(
+            counts=[int(c) for c in self._counts],
+            angular_velocities=[float(v) for v in ang_vel],
+            timestamp=self._t,
+        )
