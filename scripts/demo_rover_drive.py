@@ -11,9 +11,11 @@ error.
 
 Keyboard controls (interactive viewer mode)
 -------------------------------------------
-Motion is on the **arrow keys**, not WASD: the Genesis viewer reserves A/D
-(auto-rotate / wireframe) and would swallow the drive keys, so steering moved
-to the arrows where it does not collide with a viewer hotkey.
+Motion is on the **arrow keys**, not WASD. Keys are captured by the Genesis
+viewer window itself (the built-in viewer hotkeys are disabled so nothing
+shadows them), so **click the 3-D window once to give it keyboard focus** —
+mouse orbit/zoom works regardless, but the drive keys need window focus. A
+terminal key poller stays active as a fallback when the console is focused.
 
     Up / Down    forward / reverse velocity target  (m/s)
     Left / Right spin left / right (yaw rate)       (rad/s)
@@ -135,9 +137,10 @@ WORLD_RESOLUTION = 80
 WORLD_FLAT_RADIUS_M = 4.0          # fully flat spawn pad (balancer-safe)
 WORLD_BLEND_RADIUS_M = 9.0         # height blends to full terrain by here
 WORLD_SEED = 4242
-CABLE_LINK_COUNT = 48
-RUT_DECAL_COUNT = 200
-RUT_DROP_SPACING_M = 0.22          # advance distance between rut stamps
+CABLE_LINK_COUNT = 28
+RUT_DECAL_COUNT = 80
+RUT_DROP_SPACING_M = 0.25          # advance distance between rut stamps
+WORLD_VISUAL_HZ = 30.0             # cable re-draping rate (decoupled from sim Hz)
 
 DEFAULT_PROFILE = "two_wheel_diff"
 DEFAULT_PHYSICS = _PROJECT_ROOT / "configs" / "physics.yaml"
@@ -351,6 +354,82 @@ class KeyboardPoll:
                 self._queue.append(ch)
 
 
+class ViewerControls:
+    """Drive the rover from the Genesis viewer window itself.
+
+    ``KeyboardPoll`` only sees keystrokes when the *terminal* has focus, but
+    while flying the camera the user is focused on the 3-D window, so the
+    arrows never reached the rover. Genesis exposes a viewer keybinding API;
+    registering here means the focused viewer window feeds the same control
+    tokens ``run_loop`` already understands ("UP", " ", "1", "[", "r", ...).
+
+    Callbacks fire on the viewer thread, so the queue is mutex-guarded exactly
+    like :class:`KeyboardPoll`. Motion keys bind on HOLD (press-and-hold to
+    keep accelerating); discrete actions bind on PRESS.
+    """
+
+    def __init__(self) -> None:
+        self._queue: list[str] = []
+        self._lock = threading.Lock()
+
+    def _push(self, token: str) -> None:
+        with self._lock:
+            self._queue.append(token)
+
+    def pop_all(self) -> list[str]:
+        with self._lock:
+            out = self._queue[:]
+            self._queue.clear()
+            return out
+
+    def attach(self, viewer) -> bool:
+        """Register keybinds on a Genesis viewer. Returns False if unavailable."""
+        if viewer is None or not hasattr(viewer, "register_keybinds"):
+            return False
+        from genesis.vis.keybindings import Key, KeyAction, Keybind
+
+        hold = KeyAction.HOLD
+        press = KeyAction.PRESS
+        # (name, Key, token, action)
+        spec = [
+            ("mr_drive_fwd", Key.UP, "UP", hold),
+            ("mr_drive_rev", Key.DOWN, "DOWN", hold),
+            ("mr_spin_left", Key.LEFT, "LEFT", hold),
+            ("mr_spin_right", Key.RIGHT, "RIGHT", hold),
+            ("mr_stop", Key.SPACE, " ", press),
+            ("mr_joint_1", Key._1, "1", press),
+            ("mr_joint_2", Key._2, "2", press),
+            ("mr_joint_3", Key._3, "3", press),
+            ("mr_joint_4", Key._4, "4", press),
+            ("mr_jog_minus", Key.BRACKETLEFT, "[", press),
+            ("mr_jog_plus", Key.BRACKETRIGHT, "]", press),
+            ("mr_grip_open", Key.O, "o", press),
+            ("mr_grip_close", Key.C, "c", press),
+            ("mr_arm_stow", Key.X, "x", press),
+            ("mr_reset", Key.R, "r", press),
+            ("mr_quit", Key.Q, "q", press),
+            ("mr_quit_esc", Key.ESCAPE, "\x1b", press),
+        ]
+        binds = [
+            Keybind(name=n, key=k, key_action=a,
+                    callback=self._push, args=(tok,))
+            for (n, k, tok, a) in spec
+        ]
+        try:
+            viewer.register_keybinds(*binds, overwrite=True)
+            return True
+        except Exception as exc:  # noqa: BLE001 - keep terminal fallback
+            print(f"  Viewer keybind registration failed ({exc}); "
+                  "terminal keys only.")
+            return False
+
+
+def _get_viewer(engine: GenesisPhysicsEngine):
+    """Best-effort handle on the live Genesis viewer (None if headless)."""
+    scene = getattr(engine, "_scene", None)
+    return getattr(scene, "viewer", None) if scene is not None else None
+
+
 # ---------------------------------------------------------------------------
 # Balance controller
 # ---------------------------------------------------------------------------
@@ -558,6 +637,45 @@ class ArmBridge:
             )
         except (AttributeError, TypeError):
             pass
+
+    def snap(self) -> None:
+        """Hard-set the arm/gripper DOFs to the current target *now*.
+
+        The URDF spawns the arm at its zero pose (links straight out in front
+        of the axle). If we only ``sync()`` a position target, the PD servo
+        sweeps the ~2 kg arm from straight-out to folded over the first
+        fraction of a second — a large moving pitch moment that knocks the
+        balancer over before it has even settled. Calling this once after
+        ``build_scene()`` teleports the joints (and zeros their velocity) so
+        the rover *starts* folded and the balancer only ever sees the stowed
+        configuration.
+        """
+        targets = np.asarray(self._arm.get_state().joint_positions, dtype=np.float32)
+        if targets.size == self._num_dof:
+            try:
+                self._entity.set_dofs_position(
+                    position=targets, dofs_idx_local=self._dof_local
+                )
+                self._entity.set_dofs_velocity(
+                    velocity=np.zeros(self._num_dof, dtype=np.float32),
+                    dofs_idx_local=self._dof_local,
+                )
+            except (AttributeError, TypeError):
+                pass
+        if self._gripper_dof_local:
+            half = 0.5 * float(self._arm.get_state().gripper_position)
+            try:
+                self._entity.set_dofs_position(
+                    position=np.array([half, half], dtype=np.float32),
+                    dofs_idx_local=self._gripper_dof_local,
+                )
+                self._entity.set_dofs_velocity(
+                    velocity=np.zeros(2, dtype=np.float32),
+                    dofs_idx_local=self._gripper_dof_local,
+                )
+            except (AttributeError, TypeError):
+                pass
+        self.sync()
 
     def sync(self) -> None:
         """Push SerialArm targets into Genesis. Call every physics step."""
@@ -1278,6 +1396,20 @@ def _surface(color: tuple[float, float, float]):
         return None
 
 
+def _visual_box(pos, size):
+    """A render-only Box (no collider).
+
+    The cable links and rut decals are repositioned every visual tick; if they
+    kept colliders, ~100 teleporting kinematic bodies would flood the contact
+    solver and shove the balancer over. Visual-only keeps them from perturbing
+    the physics at all.
+    """
+    try:
+        return gs.morphs.Box(pos=pos, size=size, collision=False)
+    except TypeError:  # very old Genesis without the collision kwarg
+        return gs.morphs.Box(pos=pos, size=size)
+
+
 class LunarWorld:
     """Visible lunar scene: heightfield ground, rocks, moonbase, trailing
     cable, and analytic wheel-rut decals.
@@ -1346,6 +1478,9 @@ class LunarWorld:
         self._last_drop_xy: Optional[np.ndarray] = None
         self._cable_n = CABLE_LINK_COUNT
         self._rut_n = RUT_DECAL_COUNT
+        self._link_half_h = 0.025  # half of the cable link box height
+        self._vis_accum = 1.0e9    # force a cable redrape on the first step
+        self._vis_period = 1.0 / WORLD_VISUAL_HZ
 
     # -- geometry helpers ------------------------------------------------
     @property
@@ -1439,8 +1574,8 @@ class LunarWorld:
         for i in range(self._cable_n):
             engine.add_entity(
                 f"cable_link_{i:03d}",
-                gs.morphs.Box(pos=(0.0, 0.0, -50.0 - i),
-                              size=(0.12, 0.05, 0.05)),
+                _visual_box(pos=(0.0, 0.0, -50.0 - i),
+                            size=(0.13, 0.05, 0.05)),
                 gs.materials.Rigid(), **cable_kw,
             )
 
@@ -1452,8 +1587,8 @@ class LunarWorld:
         for i in range(self._rut_n):
             engine.add_entity(
                 f"rut_{i:03d}",
-                gs.morphs.Box(pos=(0.0, 0.0, -80.0 - i),
-                              size=(0.24, 0.13, 0.04)),
+                _visual_box(pos=(0.0, 0.0, -80.0 - i),
+                            size=(0.24, 0.13, 0.04)),
                 gs.materials.Rigid(), **rut_kw,
             )
 
@@ -1484,13 +1619,19 @@ class LunarWorld:
         p1 = np.array([self._anchor[0], self._anchor[1], self._anchor_z])
         span = float(np.linalg.norm(p1[:2] - p0[:2]))
         sag = min(0.45, 0.06 * span)
+        seg_yaw = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
+        quat = self._yaw_quat(seg_yaw)
         for i in range(self._cable_n):
             s = i / max(self._cable_n - 1, 1)
             xy = p0[:2] * (1 - s) + p1[:2] * s
             z = p0[2] * (1 - s) + p1[2] * s - sag * math.sin(math.pi * s)
-            seg_yaw = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
+            # The cable rests *on* the regolith: never let a link sink below
+            # the local terrain surface, so it drapes over the ground and
+            # follows bumps instead of clipping through them.
+            floor = self.ground_z(float(xy[0]), float(xy[1])) + self._link_half_h
+            z = max(z, floor)
             self._place(engine, f"cable_link_{i:03d}",
-                        np.array([xy[0], xy[1], z]), self._yaw_quat(seg_yaw))
+                        np.array([xy[0], xy[1], z]), quat)
 
     def _drop_ruts(self, engine: GenesisPhysicsEngine, rover_pos: np.ndarray,
                    yaw: float, body_v: float,
@@ -1529,8 +1670,14 @@ class LunarWorld:
 
     def step(self, engine: GenesisPhysicsEngine, rover_pos: np.ndarray,
              yaw: float, body_v: float,
-             wheel_omega: tuple[float, float]) -> None:
-        self._update_cable(engine, rover_pos, yaw)
+             wheel_omega: tuple[float, float], dt: float) -> None:
+        # Redrape the cable at WORLD_VISUAL_HZ, not the 120 Hz physics rate —
+        # re-posing every link every step is the bulk of the visual cost.
+        self._vis_accum += dt
+        if self._vis_accum >= self._vis_period:
+            self._vis_accum = 0.0
+            self._update_cable(engine, rover_pos, yaw)
+        # Rut stamps are self-throttled by travel distance.
         self._drop_ruts(engine, rover_pos, yaw, body_v, wheel_omega)
 
     def print_summary(self) -> None:
@@ -1564,7 +1711,8 @@ def print_header(args: argparse.Namespace, profile: dict) -> None:
         print("  *** Subsequent runs are cached and start in seconds.              ***")
     if not args.no_viewer and not args.no_keyboard:
         print("-" * 92)
-        print("  Keys: Up/Down drive  Left/Right spin  Space stop")
+        print("  Keys (click the 3-D window first so it has keyboard focus):")
+        print("        Up/Down drive  Left/Right spin (hold to keep going)  Space stop")
         print("        1..4 select joint   [ / ] jog joint  O/C gripper  X stow")
         print("        R reset pose   ESC/Q quit")
     print("=" * 92)
@@ -1643,6 +1791,10 @@ def main() -> int:
             camera_pos=(spawn_xy[0] + 2.5, spawn_xy[1] - 2.5, 1.6),
             camera_lookat=(spawn_xy[0], spawn_xy[1], 0.5),
             camera_fov=45,
+            # Drop the built-in viewer hotkeys (A/D/W/S/Z/R/...). They never
+            # reached the rover anyway and they are exactly what shadowed the
+            # drive keys; we install our own bindings on the viewer below.
+            enable_default_keybinds=False,
         )
 
     print_header(args, profile)
@@ -1742,6 +1894,9 @@ def main() -> int:
             num_dof=int(arm_cfg_yaml.get("num_dof", 4)),
             stroke_m=float(arm_cfg_yaml.get("gripper", {}).get("stroke_m", 0.1)),
         )
+        # Spawn already folded over the body — do not let the servo sweep the
+        # arm in from straight-out while the balancer is still settling.
+        arm_bridge.snap()
 
         # Traction-limited torque cap. On the moon the rover only weighs
         # m*g ≈ 41 N, so each wheel can transmit at most ~mu*(m*g/2)*r ≈ a few
@@ -1771,14 +1926,25 @@ def main() -> int:
         balance = BalanceController(max_torque_nm=tau_cap)
 
         keyboard = None
+        viewer_controls = None
         if not args.no_viewer and not args.no_keyboard:
             keyboard = KeyboardPoll()
             keyboard.start()
+            # The real fix for "arrows do nothing": bind them on the viewer
+            # window the user is actually focused on. Terminal polling stays
+            # as a fallback for when the console has focus instead.
+            viewer_controls = ViewerControls()
+            if viewer_controls.attach(_get_viewer(engine)):
+                print("  Controls    : viewer window focused — arrows drive, "
+                      "Space stops, R resets, Q/Esc quit")
+            else:
+                print("  Controls    : focus the TERMINAL window for keys "
+                      "(viewer keybind API unavailable)")
 
         run_loop(
             engine, drive, wheel_actuator, power, arm, arm_bridge, balance,
             keyboard, cfg, args, spawn_z, capability_demo,
-            world=world, spawn_xy=spawn_xy,
+            world=world, spawn_xy=spawn_xy, viewer_controls=viewer_controls,
         )
         completed_cleanly = True
 
@@ -1818,6 +1984,7 @@ def run_loop(
     *,
     world: Optional[LunarWorld] = None,
     spawn_xy: tuple[float, float] = (0.0, 0.0),
+    viewer_controls: Optional[ViewerControls] = None,
 ) -> None:
     dt = cfg.timestep
     step_count = 0
@@ -1867,9 +2034,14 @@ def run_loop(
                 )
                 self_test_arm_phase = 2
 
-        # 1. Drain keyboard events.
+        # 1. Drain keyboard events (terminal poll + viewer-window keybinds).
+        events: list[str] = []
         if keyboard is not None:
-            for ch in keyboard.pop_all():
+            events.extend(keyboard.pop_all())
+        if viewer_controls is not None:
+            events.extend(viewer_controls.pop_all())
+        if events:
+            for ch in events:
                 lower = ch.lower()
                 if ch == "\x1b" or lower == "q":  # ESC or Q
                     print("\n  Quit key pressed.")
@@ -1947,7 +2119,8 @@ def run_loop(
         # 4b. Slide the trailing cable and stamp wheel-rut decals.
         if world is not None:
             world.step(
-                engine, rover_pos, yaw, body_v, wheel_actuator.wheel_omega()
+                engine, rover_pos, yaw, body_v,
+                wheel_actuator.wheel_omega(), dt,
             )
 
         # 5. Power accounting.

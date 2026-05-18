@@ -217,3 +217,211 @@ class ManipulationSequencer(ABC):
             arm.move_to_config(stow_config)
         """
         raise NotImplementedError("get_stow_with_payload_pose implementation pending")
+
+
+# ---------------------------------------------------------------------------
+# Concrete implementation
+# ---------------------------------------------------------------------------
+
+import logging  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+
+def _pose7(x: float, y: float, z: float, qx: float = 0.0, qy: float = 0.0,
+           qz: float = 0.0, qw: float = 1.0) -> np.ndarray:
+    return np.array([x, y, z, qx, qy, qz, qw], dtype=np.float64)
+
+
+def _surface_normal_to_quat(normal: np.ndarray) -> np.ndarray:
+    """Convert surface normal to quaternion orienting Z-axis toward normal."""
+    n = normal / (np.linalg.norm(normal) + 1e-9)
+    z = np.array([0.0, 0.0, 1.0])
+    cross = np.cross(z, n)
+    cross_norm = np.linalg.norm(cross)
+    if cross_norm < 1e-9:
+        if n[2] > 0:
+            return np.array([0.0, 0.0, 0.0, 1.0])
+        else:
+            return np.array([0.0, 1.0, 0.0, 0.0])
+    axis = cross / cross_norm
+    angle = float(np.arccos(np.clip(np.dot(z, n), -1.0, 1.0)))
+    s = np.sin(angle / 2.0)
+    return np.array([axis[0] * s, axis[1] * s, axis[2] * s, np.cos(angle / 2.0)])
+
+
+class ArmManipulationSequencer(ManipulationSequencer):
+    """Concrete manipulation sequencer for antenna placement pipeline.
+
+    Waypoints are expressed in rover body frame as 7-element poses
+    [x, y, z, qx, qy, qz, qw]. Approach, grasp, carry, place, and stow
+    phases are each broken into a small set of linearly interpolated
+    intermediate poses to allow smooth arm trajectory following.
+
+    The execute_task() method orchestrates a complete task using the arm's
+    follow_trajectory() interface and monitors success/failure.
+    """
+
+    # Nominal arm geometry constants (can be overridden via subclass or config)
+    _ARM_REACH_M: float = 0.8          # max arm reach in metres
+    _APPROACH_STANDOFF_M: float = 0.15 # how far above target to approach from
+    _CARRY_HEIGHT_M: float = 0.30      # z of payload during carry
+    _CARRY_X_M: float = 0.40           # forward offset during carry
+    _MAX_TASK_RETRIES: int = 2
+
+    def __init__(
+        self,
+        approach_standoff_m: float = 0.15,
+        carry_height_m: float = 0.30,
+    ) -> None:
+        self._approach_standoff_m = approach_standoff_m
+        self._carry_height_m = carry_height_m
+        self._current_task: ManipulationTask | None = None
+
+    # ------------------------------------------------------------------
+    # Waypoint builders
+    # ------------------------------------------------------------------
+
+    def plan_pickup(
+        self,
+        depot_pose: np.ndarray,
+        antenna_pose: np.ndarray,
+    ) -> List[np.ndarray]:
+        """Generate approach → pre-grasp → grasp → retract waypoints."""
+        target = antenna_pose[:3].copy()
+        standoff = np.array([0.0, 0.0, self._approach_standoff_m])
+
+        approach = _pose7(*(target + standoff))
+        pre_grasp = _pose7(*(target + standoff * 0.5))
+        grasp = _pose7(*target, *antenna_pose[3:] if len(antenna_pose) >= 7 else [0, 0, 0, 1])
+        retract = _pose7(*(target + standoff * 1.5))
+        carry = self.get_stow_with_payload_pose()
+
+        return [approach, pre_grasp, grasp, retract, carry]
+
+    def plan_placement(
+        self,
+        target_position: np.ndarray,
+        surface_normal: np.ndarray,
+    ) -> List[np.ndarray]:
+        """Generate approach → align → contact → release → retract waypoints."""
+        tgt = target_position[:3].copy()
+        q = _surface_normal_to_quat(surface_normal)
+        normal_unit = surface_normal / (np.linalg.norm(surface_normal) + 1e-9)
+
+        above = tgt + normal_unit * self._approach_standoff_m * 2.0
+        approach = _pose7(*above, *q)
+        align = _pose7(*(tgt + normal_unit * self._approach_standoff_m), *q)
+        contact = _pose7(*tgt, *q)
+        release = _pose7(*tgt, *q)           # gripper opens at this pose
+        retract = _pose7(*above, *q)
+
+        return [approach, align, contact, release, retract]
+
+    def plan_cable_connection(
+        self,
+        antenna_port_pose: np.ndarray,
+    ) -> List[np.ndarray]:
+        """Generate approach → align → contact → mate → retract waypoints."""
+        port_pos = antenna_port_pose[:3].copy()
+        q = antenna_port_pose[3:7] if len(antenna_port_pose) >= 7 else np.array([0, 0, 0, 1.0])
+
+        # Approach from +Z above the port
+        above = port_pos + np.array([0.0, 0.0, self._approach_standoff_m * 2.0])
+        approach = _pose7(*above, *q)
+        pre_align = _pose7(*(port_pos + np.array([0.0, 0.0, self._approach_standoff_m])), *q)
+        contact = _pose7(*port_pos, *q)
+        mated = _pose7(*port_pos, *q)    # small push to seat connector
+        retract = _pose7(*above, *q)
+
+        return [approach, pre_align, contact, mated, retract]
+
+    # ------------------------------------------------------------------
+    # Task execution
+    # ------------------------------------------------------------------
+
+    def execute_task(
+        self,
+        task: ManipulationTask,
+        arm: "ManipulatorArm",
+    ) -> bool:
+        self._current_task = task
+        success = False
+        for attempt in range(self._MAX_TASK_RETRIES + 1):
+            try:
+                success = self._run_task(task, arm)
+                if success:
+                    break
+                logger.warning("Task %s attempt %d/%d failed, retrying", task.value, attempt + 1, self._MAX_TASK_RETRIES + 1)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Task %s raised exception on attempt %d: %s", task.value, attempt + 1, exc)
+                try:
+                    arm.abort()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._current_task = None
+        return success
+
+    def _run_task(self, task: ManipulationTask, arm: "ManipulatorArm") -> bool:
+        if task == ManipulationTask.TRANSPORT_STOW:
+            stow = self.get_stow_with_payload_pose()
+            return bool(arm.follow_trajectory([stow]))
+
+        if task == ManipulationTask.ANTENNA_PICKUP:
+            # Build nominal pick from depot directly in front of rover
+            depot = _pose7(0.5, 0.0, -0.3)
+            antenna = _pose7(0.5, 0.0, -0.35)
+            waypoints = self.plan_pickup(depot, antenna)
+            if not arm.follow_trajectory(waypoints[:-2]):  # approach → grasp
+                return False
+            # Close gripper
+            try:
+                arm.command_gripper(0.0)
+            except AttributeError:
+                pass
+            # Retract and stow
+            return bool(arm.follow_trajectory(waypoints[-2:]))
+
+        if task == ManipulationTask.ANTENNA_PLACEMENT:
+            # Placement location assumed to be set by caller via a target pose;
+            # use a nominal ground-level target directly forward of the rover.
+            target = np.array([0.6, 0.0, 0.0])
+            normal = np.array([0.0, 0.0, 1.0])
+            waypoints = self.plan_placement(target, normal)
+            if not arm.follow_trajectory(waypoints[:3]):  # approach → contact
+                return False
+            # Open gripper to release
+            try:
+                arm.command_gripper(1.0)
+            except AttributeError:
+                pass
+            return bool(arm.follow_trajectory(waypoints[3:]))  # retract
+
+        if task == ManipulationTask.CABLE_CONNECTION:
+            port = _pose7(0.5, 0.0, 0.15)
+            waypoints = self.plan_cable_connection(port)
+            return bool(arm.follow_trajectory(waypoints))
+
+        if task == ManipulationTask.CABLE_REEL_PICKUP:
+            depot = _pose7(0.4, 0.0, -0.25)
+            reel = _pose7(0.4, 0.0, -0.30)
+            waypoints = self.plan_pickup(depot, reel)
+            if not arm.follow_trajectory(waypoints[:-2]):
+                return False
+            try:
+                arm.command_gripper(0.0)
+            except AttributeError:
+                pass
+            return bool(arm.follow_trajectory(waypoints[-2:]))
+
+        logger.warning("Unknown task type: %s", task)
+        return False
+
+    def get_stow_with_payload_pose(self) -> np.ndarray:
+        """Return body-frame stow pose: tucked in, centred, slightly raised."""
+        return _pose7(
+            x=self._CARRY_X_M,
+            y=0.0,
+            z=self._CARRY_HEIGHT_M,
+            qx=0.0, qy=0.0, qz=0.0, qw=1.0,
+        )
