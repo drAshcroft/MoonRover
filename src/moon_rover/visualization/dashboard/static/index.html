@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Moon Rover · Mission Dashboard</title>
+<style>
+  :root {
+    --bg: #0a0e17;
+    --panel: #121826;
+    --panel-2: #1a2235;
+    --line: #243049;
+    --text: #d6e0f0;
+    --muted: #7d8aa5;
+    --accent: #4ea1ff;
+    --ok: #38d39f;
+    --warn: #f5b942;
+    --crit: #ff5d6c;
+    --grid: #2a3550;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI", system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 12px 20px; background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 18px; font-weight: 600; letter-spacing: .3px; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  .status-pill {
+    margin-left: auto; padding: 5px 14px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .5px; background: var(--panel-2); color: var(--muted);
+  }
+  .status-pill.running { background: rgba(56,211,159,.15); color: var(--ok); }
+  .status-pill.completed { background: rgba(78,161,255,.15); color: var(--accent); }
+  .status-pill.failed { background: rgba(255,93,108,.15); color: var(--crit); }
+  .conn { font-size: 12px; color: var(--muted); display:flex; align-items:center; gap:6px;}
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--crit); }
+  .dot.live { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+
+  main { flex: 1; display: grid; grid-template-columns: 1fr 360px; gap: 14px; padding: 14px; overflow: hidden; }
+  .map-wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; position: relative; overflow: hidden; }
+  #map { width: 100%; height: 100%; display: block; }
+  .map-legend {
+    position: absolute; left: 14px; bottom: 12px; font-size: 11px;
+    background: rgba(10,14,23,.78); border:1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; display:grid; gap:5px;
+  }
+  .map-legend span { display:flex; align-items:center; gap:7px; color: var(--muted); }
+  .swatch { width: 11px; height: 11px; border-radius: 3px; }
+
+  .side { display: flex; flex-direction: column; gap: 14px; overflow-y: auto; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 12px; }
+
+  .progress-track { height: 10px; background: var(--panel-2); border-radius: 6px; overflow: hidden; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--ok)); width: 0%; transition: width .4s ease; }
+  .progress-meta { display:flex; justify-content: space-between; margin-top: 8px; font-size: 13px; color: var(--muted); }
+  .progress-meta b { color: var(--text); }
+
+  .rover { border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:10px; background: var(--panel-2); }
+  .rover:last-child { margin-bottom: 0; }
+  .rover-top { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .rover-dot { width:10px; height:10px; border-radius:50%; }
+  .rover-name { font-weight:600; font-size:14px; }
+  .rover-phase { margin-left:auto; font-size:11px; color: var(--muted); text-transform: uppercase; letter-spacing:.4px; }
+  .bat-track { height: 8px; background:#0c1120; border-radius:5px; overflow:hidden; margin-top:4px; }
+  .bat-fill { height:100%; transition: width .4s ease, background .4s ease; }
+  .rover-stats { display:flex; justify-content:space-between; font-size:11px; color:var(--muted); margin-top:6px; }
+  .fault-tag { font-size:10px; color: var(--crit); font-weight:600; }
+
+  .faults { max-height: 240px; overflow-y:auto; display:flex; flex-direction:column; gap:7px; }
+  .fault { font-size:12px; padding:8px 10px; border-radius:6px; border-left:3px solid var(--muted); background: var(--panel-2); }
+  .fault.critical { border-left-color: var(--crit); }
+  .fault.warning  { border-left-color: var(--warn); }
+  .fault .ftop { display:flex; justify-content:space-between; }
+  .fault .frover { color: var(--accent); font-weight:600; }
+  .fault .ftime  { color: var(--muted); font-size:11px; }
+  .fault .fdesc  { color: var(--muted); margin-top:3px; }
+  .fault.resolved { opacity:.45; }
+  .empty { color: var(--muted); font-size:12px; font-style: italic; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🛰️ Moon Rover <span class="sub">Mission Dashboard</span></h1>
+  <div class="conn"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></div>
+  <div class="status-pill" id="statusPill">idle</div>
+</header>
+
+<main>
+  <div class="map-wrap">
+    <canvas id="map"></canvas>
+    <div class="map-legend">
+      <span><span class="swatch" style="background:#4ea1ff"></span>depot / moonbase</span>
+      <span><span class="swatch" style="background:#3a4663"></span>unvisited grid point</span>
+      <span><span class="swatch" style="background:#f5b942"></span>equipped</span>
+      <span><span class="swatch" style="background:#38d39f"></span>complete</span>
+      <span><span class="swatch" style="background:#ff5d6c"></span>rover (fault)</span>
+    </div>
+  </div>
+
+  <div class="side">
+    <div class="card">
+      <h2>Mission Progress</h2>
+      <div class="progress-track"><div class="progress-fill" id="progFill"></div></div>
+      <div class="progress-meta">
+        <span><b id="progPct">0%</b> grid deployed</span>
+        <span>sim&nbsp;<b id="simTime">0.0</b>s</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Rovers</h2>
+      <div id="rovers"><div class="empty">awaiting telemetry…</div></div>
+    </div>
+
+    <div class="card">
+      <h2>Fault Log</h2>
+      <div class="faults" id="faults"><div class="empty">no faults</div></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const canvas = document.getElementById('map');
+const ctx = canvas.getContext('2d');
+let latest = null;
+
+function fitCanvas() {
+  const r = canvas.parentElement.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = r.width * dpr;
+  canvas.height = r.height * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', fitCanvas);
+fitCanvas();
+
+const ROVER_COLORS = ['#4ea1ff', '#38d39f', '#f5b942', '#c98bff', '#ff8b5d'];
+function roverColor(i, fault) { return fault ? '#ff5d6c' : ROVER_COLORS[i % ROVER_COLORS.length]; }
+
+function worldToScreen(b, x, y, w, h, pad) {
+  const sx = (b.x_max - b.x_min) || 1, sy = (b.y_max - b.y_min) || 1;
+  const scale = Math.min((w - 2*pad) / sx, (h - 2*pad) / sy);
+  const ox = pad + (w - 2*pad - sx*scale)/2;
+  const oy = pad + (h - 2*pad - sy*scale)/2;
+  return [ ox + (x - b.x_min) * scale, h - (oy + (y - b.y_min) * scale) ];
+}
+
+function drawMap() {
+  const w = canvas.clientWidth, h = canvas.clientHeight, pad = 48;
+  ctx.clearRect(0, 0, w, h);
+  if (!latest || !latest.grid_bounds) {
+    ctx.fillStyle = '#7d8aa5'; ctx.font = '14px Segoe UI';
+    ctx.fillText('waiting for simulation telemetry…', 24, 32);
+    return;
+  }
+  const b = latest.grid_bounds;
+
+  // grid lines
+  ctx.strokeStyle = '#1c2740'; ctx.lineWidth = 1;
+  for (let i = 0; i <= 10; i++) {
+    const gx = b.x_min + (b.x_max-b.x_min)*i/10;
+    const gy = b.y_min + (b.y_max-b.y_min)*i/10;
+    let p1 = worldToScreen(b, gx, b.y_min, w, h, pad);
+    let p2 = worldToScreen(b, gx, b.y_max, w, h, pad);
+    ctx.beginPath(); ctx.moveTo(p1[0],p1[1]); ctx.lineTo(p2[0],p2[1]); ctx.stroke();
+    p1 = worldToScreen(b, b.x_min, gy, w, h, pad);
+    p2 = worldToScreen(b, b.x_max, gy, w, h, pad);
+    ctx.beginPath(); ctx.moveTo(p1[0],p1[1]); ctx.lineTo(p2[0],p2[1]); ctx.stroke();
+  }
+
+  // cables
+  ctx.lineWidth = 2;
+  for (const cable of (latest.cables || [])) {
+    ctx.strokeStyle = 'rgba(120,150,210,.45)';
+    ctx.beginPath();
+    cable.forEach((pt, i) => {
+      const s = worldToScreen(b, pt[0], pt[1], w, h, pad);
+      i ? ctx.lineTo(s[0], s[1]) : ctx.moveTo(s[0], s[1]);
+    });
+    ctx.stroke();
+  }
+
+  // grid points
+  for (const gp of (latest.grid_points || [])) {
+    const s = worldToScreen(b, gp.position[0], gp.position[1], w, h, pad);
+    const col = gp.status === 'complete' ? '#38d39f'
+              : gp.status === 'equipped' ? '#f5b942'
+              : gp.status === 'visited'  ? '#6f7fa6' : '#3a4663';
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(s[0], s[1], 6, 0, 7); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,.4)'; ctx.lineWidth = 1; ctx.stroke();
+  }
+
+  // depot
+  if (latest.depot_position) {
+    const d = worldToScreen(b, latest.depot_position[0], latest.depot_position[1], w, h, pad);
+    ctx.fillStyle = '#4ea1ff';
+    ctx.beginPath();
+    ctx.moveTo(d[0], d[1]-10); ctx.lineTo(d[0]+9, d[1]+7); ctx.lineTo(d[0]-9, d[1]+7);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#7d8aa5'; ctx.font = '11px Segoe UI';
+    ctx.fillText('MOONBASE', d[0]-26, d[1]+22);
+  }
+
+  // rovers
+  (latest.rovers || []).forEach((rv, i) => {
+    const s = worldToScreen(b, rv.position[0], rv.position[1], w, h, pad);
+    const col = roverColor(i, rv.fault_active);
+    if (rv.target) {
+      const t = worldToScreen(b, rv.target[0], rv.target[1], w, h, pad);
+      ctx.strokeStyle = col + '66'; ctx.setLineDash([5,5]); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(s[0],s[1]); ctx.lineTo(t[0],t[1]); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.save();
+    ctx.translate(s[0], s[1]); ctx.rotate(-rv.heading_rad);
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.moveTo(11,0); ctx.lineTo(-7,-7); ctx.lineTo(-4,0); ctx.lineTo(-7,7);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = '#d6e0f0'; ctx.font = '11px Segoe UI';
+    ctx.fillText(rv.rover_id, s[0]+12, s[1]-10);
+  });
+}
+
+function renderSide() {
+  if (!latest) return;
+  document.getElementById('statusPill').textContent = latest.status || 'idle';
+  document.getElementById('statusPill').className = 'status-pill ' + (latest.status || '');
+  const pct = Math.round((latest.progress || 0) * 100);
+  document.getElementById('progFill').style.width = pct + '%';
+  document.getElementById('progPct').textContent = pct + '%';
+  document.getElementById('simTime').textContent = (latest.sim_time_s || 0).toFixed(1);
+
+  const rc = document.getElementById('rovers');
+  if (!latest.rovers || !latest.rovers.length) {
+    rc.innerHTML = '<div class="empty">awaiting telemetry…</div>';
+  } else {
+    rc.innerHTML = latest.rovers.map((rv, i) => {
+      const soc = Math.max(0, Math.min(1, rv.battery_soc));
+      const pctB = Math.round(soc * 100);
+      const bcol = soc > 0.4 ? '#38d39f' : soc > 0.2 ? '#f5b942' : '#ff5d6c';
+      const col = roverColor(i, rv.fault_active);
+      const fault = rv.fault_active ? `<span class="fault-tag">⚠ ${rv.fault_active}</span>` : '';
+      return `<div class="rover">
+        <div class="rover-top">
+          <span class="rover-dot" style="background:${col}"></span>
+          <span class="rover-name">${rv.rover_id}</span>
+          <span class="rover-phase">${rv.phase}</span>
+        </div>
+        <div class="bat-track"><div class="bat-fill" style="width:${pctB}%;background:${bcol}"></div></div>
+        <div class="rover-stats">
+          <span>🔋 ${pctB}%</span>
+          <span>🧵 ${rv.cable_length_remaining_m.toFixed(1)} m</span>
+          <span>${rv.cable_tension_n.toFixed(0)} N</span>
+          ${fault}
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  const fc = document.getElementById('faults');
+  if (!latest.faults || !latest.faults.length) {
+    fc.innerHTML = '<div class="empty">no faults</div>';
+  } else {
+    fc.innerHTML = latest.faults.slice().reverse().map(f => `
+      <div class="fault ${f.severity} ${f.resolved ? 'resolved' : ''}">
+        <div class="ftop">
+          <span class="frover">${f.rover_id} · ${f.fault_type}</span>
+          <span class="ftime">t=${f.timestamp_s.toFixed(1)}s</span>
+        </div>
+        <div class="fdesc">${f.description} → ${f.recovery_action}${f.resolved ? ' ✓' : ''}</div>
+      </div>`).join('');
+  }
+}
+
+function setConn(live) {
+  document.getElementById('connDot').className = 'dot' + (live ? ' live' : '');
+  document.getElementById('connText').textContent = live ? 'live' : 'disconnected';
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/telemetry`);
+  ws.onopen = () => setConn(true);
+  ws.onclose = () => { setConn(false); setTimeout(connect, 1500); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (ev) => {
+    const data = JSON.parse(ev.data);
+    if (data.heartbeat) return;
+    latest = data;
+    renderSide();
+  };
+}
+connect();
+
+function loop() { drawMap(); requestAnimationFrame(loop); }
+loop();
+</script>
+</body>
+</html>

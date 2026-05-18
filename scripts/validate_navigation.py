@@ -466,7 +466,7 @@ def run(args: argparse.Namespace) -> bool:
                 f"{step:>5}  {t:>6.2f}  "
                 f"{gt.x:>7.3f} {gt.y:>7.3f} {math.degrees(gt.yaw):>7.2f}  "
                 f"{ekf_x:>7.3f} {ekf_y:>7.3f} {math.degrees(ekf_yaw):>7.2f}  "
-                f"{pos_err:>8.4f}  {math.degrees(yaw_err):>8.3f}°  "
+                f"{pos_err:>8.4f}  {math.degrees(yaw_err):>8.3f}d  "
                 f"{n_beacons:>7d}  "
                 f"{v_mpc:>6.3f} {w_mpc:>6.3f}"
             )
@@ -501,9 +501,9 @@ def run(args: argparse.Namespace) -> bool:
         mpc.configure(MPCConfig())
     for slope, tension, label in [
         (0.0, 0.0, "flat / no tension"),
-        (10.0, 0.0, "10° slope / no tension"),
-        (18.0, 0.0, "18° slope / no tension"),
-        (26.0, 0.0, "26° slope (impassable)"),
+        (10.0, 0.0, "10deg slope / no tension"),
+        (18.0, 0.0, "18deg slope / no tension"),
+        (26.0, 0.0, "26deg slope (impassable)"),
         (0.0, 150.0, "flat / 150 N (below threshold)"),
         (0.0, 300.0, "flat / 300 N (scaling)"),
         (0.0, 450.0, "flat / 450 N (above 400 N -> stop)"),
@@ -560,7 +560,7 @@ def run(args: argparse.Namespace) -> bool:
           f"max={pos_errors_arr.max():.4f} m")
     check("EKF position accuracy reported",
           ekf.get_position_accuracy() < 10.0,
-          f"1σ={ekf.get_position_accuracy():.4f} m")
+          f"1s={ekf.get_position_accuracy():.4f} m")
     check("A* path returned valid waypoints",
           len(planned_path.waypoints) >= 2,
           f"{len(planned_path.waypoints)} pts, {planned_path.total_distance_m:.2f} m")
@@ -583,7 +583,7 @@ def run(args: argparse.Namespace) -> bool:
     check("Cable map clearance = inf (empty)",
           not np.isfinite(cable_clearance) or cable_clearance > 1000,
           f"d={cable_clearance:.1f}")
-    check("Speed limit 0 at 26° slope (impassable)",
+    check("Speed limit 0 at 26deg slope (impassable)",
           mpc.get_speed_limit(26.0, 0.0) == 0.0)
     check("Speed limit 0 at 450 N cable tension",
           mpc.get_speed_limit(0.0, 450.0) == 0.0)
