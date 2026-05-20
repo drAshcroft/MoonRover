@@ -425,6 +425,7 @@ class ViewerControls:
             ("mr_grip_close", Key.C, "c", press),
             ("mr_arm_stow", Key.X, "x", press),
             ("mr_reset", Key.R, "r", press),
+            ("mr_nav_start", Key.F5, "F5", press),
             ("mr_quit", Key.Q, "q", press),
             ("mr_quit_esc", Key.ESCAPE, "\x1b", press),
         ]
@@ -1733,6 +1734,8 @@ def print_header(args: argparse.Namespace, profile: dict) -> None:
         print("        Up/Down drive  Left/Right spin (hold to keep going)  Space stop")
         print("        1..4 select joint   [ / ] jog joint  O/C gripper  X stow")
         print("        R reset pose   ESC/Q quit")
+        if args.navigation:
+            print("        F5 start the autonomous navigation tour (planner+MPC)")
     print("=" * 92)
     print("  step |  sim_t  |  pose (x, y, yaw_deg) | pitch/roll_deg | v_user/v_meas | tauL/tauR | SoC")
     print("-" * 92)
@@ -1760,6 +1763,79 @@ def print_telemetry(
         f"{tau_left:+6.1f}/{tau_right:+6.1f} | "
         f"{soc * 100.0:5.1f}%"
     )
+
+
+# ---------------------------------------------------------------------------
+# Compile / build progress spinner
+# ---------------------------------------------------------------------------
+
+
+class ProgressSpinner:
+    """Background spinner with elapsed-time readout.
+
+    Genesis's first-run CUDA-kernel compile can take five-plus minutes and
+    runs entirely inside `engine.configure()` / `engine.build_scene()` with
+    no visible output. Without a heartbeat, the F5'd VS Code window looks
+    frozen and the user kills the run before the viewer ever appears. The
+    spinner writes a single-line tick to stdout every second so the user
+    can see the wall clock advancing and the demo is alive.
+
+    Use as a context manager:
+
+        with ProgressSpinner("Compiling Genesis kernels"):
+            engine.configure(...)
+    """
+
+    _GLYPHS = ("|", "/", "-", "\\")
+
+    def __init__(self, label: str, *, tick_s: float = 1.0) -> None:
+        self._label = label
+        self._tick_s = float(tick_s)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._t0 = 0.0
+        self._is_tty = sys.stdout.isatty()
+
+    def __enter__(self) -> "ProgressSpinner":
+        self._t0 = time.perf_counter()
+        # On a TTY we redraw a single line; in piped / debug consoles we
+        # fall back to one print per tick so the integratedTerminal in
+        # VS Code doesn't end up with a blank screen.
+        self._thread = threading.Thread(
+            target=self._run, name=f"spinner-{self._label}", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        elapsed = time.perf_counter() - self._t0
+        # Always print a clean "done" line so the spinner row is replaced.
+        suffix = "OK" if exc is None else "FAIL"
+        if self._is_tty:
+            sys.stdout.write("\r")
+        print(f"  {self._label}: {elapsed:6.2f}s  [{suffix}]")
+        sys.stdout.flush()
+
+    def _run(self) -> None:
+        i = 0
+        next_tick = self._t0
+        while not self._stop.is_set():
+            now = time.perf_counter()
+            if now >= next_tick:
+                elapsed = now - self._t0
+                glyph = self._GLYPHS[i % len(self._GLYPHS)]
+                msg = f"  {self._label}: {glyph} {elapsed:6.2f}s elapsed"
+                if self._is_tty:
+                    sys.stdout.write("\r" + msg)
+                else:
+                    print(msg)
+                sys.stdout.flush()
+                i += 1
+                next_tick = self._t0 + i * self._tick_s
+            self._stop.wait(timeout=0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -1893,6 +1969,27 @@ class NavigationDriver:
         self._plan_to(self._tour[self._tour_idx], from_xy=self._spawn)
         self._mpc_failures = 0
 
+        # Armed but idle. The rover keeps balancing in place until the
+        # operator presses N (or types n in the terminal) — that gives
+        # everyone a chance to confirm the inverted pendulum is stable
+        # before the planner starts demanding motion.
+        self._started: bool = False
+        self._start_sim_t: float = 0.0
+
+    def is_started(self) -> bool:
+        return self._started
+
+    def start(self, sim_t: float) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._start_sim_t = sim_t
+        # Re-plan from current position the first time motion starts so the
+        # MPC reference is anchored at *now*, not at the spawn pose where
+        # the demo built the navigator.
+        print(f"  [nav] F5 pressed at sim_t={sim_t:.2f}s — "
+              "planner+MPC engaged")
+
     # ------------------------------------------------------------------
     # Map construction
     # ------------------------------------------------------------------
@@ -1977,7 +2074,23 @@ class NavigationDriver:
         yaw: float,
         body_v: float,
     ) -> tuple[float, float, dict]:
-        info: dict = {}
+        info: dict = {"started": self._started}
+        if not self._started:
+            # Idle: report telemetry but command zero motion so the
+            # balance controller just station-keeps.
+            info["tension_n"] = self.cable_tension_n(rover_pos[:2])
+            info["slope_deg"] = self.terrain_slope_deg(rover_pos[:2])
+            info["goal_xy"] = (float(self._tour[self._tour_idx][0]),
+                               float(self._tour[self._tour_idx][1]))
+            info["leg_idx"] = self._tour_idx
+            info["dist_to_goal_m"] = float(
+                np.linalg.norm(rover_pos[:2] - self._tour[self._tour_idx][:2])
+            )
+            info["v_max_mps"] = 0.0
+            info["v_cmd_mps"] = 0.0
+            info["w_cmd_radps"] = 0.0
+            return 0.0, 0.0, info
+
         # Advance waypoint if we've reached the current goal.
         goal = self._tour[self._tour_idx]
         dist_to_goal = float(np.linalg.norm(rover_pos[:2] - goal[:2]))
@@ -2105,7 +2218,13 @@ def main() -> int:
     keyboard: Optional[KeyboardPoll] = None
     completed_cleanly = False
     try:
-        engine.configure(cfg, show_viewer=not args.no_viewer, viewer_options=viewer_options)
+        configure_label = (
+            "Compiling Genesis CUDA kernels (first GPU run can take 5-10 min)"
+            if args.backend == "gpu"
+            else "Initialising Genesis (first CPU run can take 0-5 min)"
+        )
+        with ProgressSpinner(configure_label):
+            engine.configure(cfg, show_viewer=not args.no_viewer, viewer_options=viewer_options)
 
         ground_friction = 1.2
         if world is not None:
@@ -2129,7 +2248,8 @@ def main() -> int:
             ROVER_NAME, rover_morph, gs.materials.Rigid(friction=ground_friction)
         )
 
-        engine.build_scene()
+        with ProgressSpinner("Building scene"):
+            engine.build_scene()
 
         drive_config = drive_config_from_profile(profile, DriveType.TWO_WHEEL_DIFF)
         drive = create_drive_system(drive_config)
@@ -2166,9 +2286,12 @@ def main() -> int:
                 print("  [nav] --navigation requires the lunar world scene; "
                       "ignoring (flat-ground or headless).")
             else:
-                navigation = NavigationDriver(world, spawn_xy, args.sim_hz)
-                print("  Navigation  : planner+MPC active — A* sets the tour, "
-                      "MPC tracks each leg, cable tension and slope feed the speed limit.")
+                with ProgressSpinner("Building navigation stack (occupancy + A* + MPC)"):
+                    navigation = NavigationDriver(world, spawn_xy, args.sim_hz)
+                print("  Navigation  : planner+MPC armed — focus the 3-D window "
+                      "and press F5 to start the autonomous tour. Cable tension "
+                      "and slope feed the speed limit so the rover slows when "
+                      "the leash bites.")
 
         # Software arm: kinematics + grasp bookkeeping; the URDF chain mirrors it.
         arm = SerialArm()
@@ -2402,6 +2525,11 @@ def run_loop(
                     prev_yaw = None
                     v_user = 0.0
                     w_user = 0.0
+                    if navigation is not None:
+                        navigation._started = False  # rearm on reset
+                elif ch == "F5":
+                    if navigation is not None and not navigation.is_started():
+                        navigation.start(engine.get_sim_time())
 
         # 2. Read body attitude and wheel state → balance torque.
         rover_pos, quat = engine.get_body_pose(ROVER_NAME)
@@ -2520,8 +2648,9 @@ def run_loop(
             v_max = last_nav_info.get("v_max_mps", 0.0)
             d = last_nav_info.get("dist_to_goal_m", 0.0)
             leg = last_nav_info.get("leg_idx", 0)
+            state = "RUN" if last_nav_info.get("started") else "ARMED (press F5)"
             print(
-                f"  nav | leg {leg + 1}/{len(navigation._tour)} -> "
+                f"  nav | {state} leg {leg + 1}/{len(navigation._tour)} -> "
                 f"({gx:5.2f},{gy:5.2f}) d={d:4.2f}m | "
                 f"cable={tension_n:5.1f}N slope={slope_deg:4.1f}deg | "
                 f"v_max={v_max:.2f} v_cmd={v_user:+.2f} w_cmd={w_user:+.2f}"
