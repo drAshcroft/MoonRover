@@ -126,6 +126,17 @@ from moon_rover.sensors import (  # noqa: E402
     SunSensorConfig,
     TrilaterationBeaconNetwork,
 )
+from moon_rover.navigation.control.mpc import MPCConfig, MPCController  # noqa: E402
+from moon_rover.navigation.perception.mapping import (  # noqa: E402
+    GridOccupancyMap,
+    GridTraversabilityMap,
+    SpatialCableMap,
+)
+from moon_rover.navigation.planning.path_planner import (  # noqa: E402
+    AStarDStarPathPlanner,
+    PlannedPath,
+    PlannerConfig,
+)
 
 ROVER_NAME = "demo_rover"
 
@@ -186,6 +197,13 @@ def parse_args() -> argparse.Namespace:
                         help="Use the legacy bare infinite ground plane instead "
                              "of the lunar heightfield / rocks / cable scene. "
                              "Headless runs always use the flat plane.")
+    parser.add_argument("--navigation", action="store_true",
+                        help="Drive the rover autonomously with the full "
+                             "navigation pipeline: A* path planner picks a tour "
+                             "across the lunar scene, MPC tracks each leg, and "
+                             "cable tension + terrain slope feed the MPC speed "
+                             "limit so the rover visibly struggles when the "
+                             "cable pulls taut. Implies --capability-demo.")
     return parser.parse_args()
 
 
@@ -1745,6 +1763,290 @@ def print_telemetry(
 
 
 # ---------------------------------------------------------------------------
+# Navigation pipeline driver (planner + MPC + cable/slope feedback)
+# ---------------------------------------------------------------------------
+
+
+class NavigationDriver:
+    """Autonomous driver: A* planner picks a path, MPC tracks it, cable
+    tension and terrain slope feed back into the MPC speed limit.
+
+    This is what makes the rover *visibly* struggle when the cable pulls
+    taut: the cable-distance proxy ramps tension into the 200-400 N band as
+    the rover gets further from the moonbase spool, and the MPC's
+    :meth:`get_speed_limit` enforces ``v *= (400 - T) / 200`` in that band
+    (full stop above 400 N). Combined with the slope penalty above ~5 deg,
+    the rover slows down on rough terrain and again when the leash bites.
+
+    A tour of waypoints around the lunar scene is planned at construction
+    time so each leg's planned path is precomputed. The rover follows the
+    legs in sequence; when the final goal is reached, the tour loops.
+    """
+
+    # Cable tension proxy (Newtons) as a function of rover-to-anchor distance:
+    # zero while there is slack, then a linear ramp once the leash bites.
+    # Tuned so the configured tour visits the 0..350 N band — light slack
+    # near the spool, MPC speed-limit kicks in past 200 N, full stop at 400 N.
+    _CABLE_TAUT_M = 9.0      # cable goes taut at this distance from spool
+    _CABLE_TENSION_PER_M = 50.0   # N gained per metre stretched past taut
+    _CABLE_TENSION_MAX_N = 500.0
+    # The balance bot tips above ~0.6 m/s under 1/6 g; cap the MPC's
+    # effective speed ceiling here. The factor is computed at init so the
+    # *shape* of the cable / slope speed curve from get_speed_limit() is
+    # preserved — only the absolute ceiling shrinks.
+    _BALANCE_SAFE_CEILING_MPS = 0.55
+
+    def __init__(
+        self,
+        world: "LunarWorld",
+        spawn_xy: tuple[float, float],
+        sim_hz: float,
+    ) -> None:
+        self._world = world
+        self._spawn = np.array(spawn_xy, dtype=np.float64)
+        self._anchor = np.asarray(world._anchor, dtype=np.float64).copy()
+        # MPC at 5 Hz: more than that just thrashes the IPOPT warm-starts and
+        # the balance controller can't react faster than its own pitch loop.
+        self._mpc_period_s = 0.2
+        self._last_mpc_t = -1.0e9
+        self._last_v_cmd = 0.0
+        self._last_w_cmd = 0.0
+
+        # Tour: drive away from the spool to stretch the cable, swing
+        # laterally so the leash drags across regolith, then come back.
+        # Max distance from the (cx-7, cy-7) anchor is ~15 m, which puts
+        # tension at ~300 N — solidly into the MPC's 200..400 N modulation
+        # band so the user can SEE the rover slow on its leash.
+        cx, cy = world.center
+        self._tour: list[np.ndarray] = [
+            np.array([cx + 2.0, cy + 0.0, 0.0]),   # ~11 m from anchor
+            np.array([cx + 4.0, cy + 2.0, 0.0]),   # ~15 m — leash bites
+            np.array([cx + 2.0, cy + 4.0, 0.0]),   # ~15 m — leash bites
+            np.array([cx + 0.0, cy + 5.0, 0.0]),   # ~13.9 m
+            np.array([cx - 3.0, cy + 2.0, 0.0]),   # ~9.9 m — slack returns
+            np.array([cx - 2.0, cy - 1.0, 0.0]),   # ~7.8 m — close to home
+        ]
+        self._tour_idx = 0
+        self._waypoint_reach_m = 0.7
+
+        # ------------------------------------------------------------------
+        # Build the navigation stack: occupancy, traversability, cable map,
+        # planner, MPC. Origin and grid shape are sized to the lunar world.
+        # ------------------------------------------------------------------
+        size = float(world._size)
+        res = 0.5  # 0.5 m planning grid
+        nx = ny = int(round(size / res))
+        # Wrap GridOccupancyMap so rocks read as occupied. The default origin
+        # is (0,0), matching our world coordinates which run (0..size).
+        self._occ = GridOccupancyMap(
+            width_m=size,
+            height_m=size,
+            origin_xy=(0.0, 0.0),
+            voxel_resolution_m=res,
+        )
+        self._mark_rocks_occupied()
+        self._cable_map = SpatialCableMap()
+        self._trav = GridTraversabilityMap(grid_shape=self._occ.grid_shape[:2])
+        self._trav.update(None, self._occ, self._cable_map)
+
+        self._planner = AStarDStarPathPlanner()
+        self._planner.configure(
+            PlannerConfig(
+                grid_resolution_m=res,
+                algorithm="a_star",
+                heading_change_penalty=0.15,
+                cable_clearance_m=1.0,
+                replan_trigger_distance_m=4.0,
+            )
+        )
+        # The planner stores its own _grid_shape from a 200x200 default;
+        # narrow it to our world so A* doesn't search outside the heightfield.
+        self._planner._grid_shape = (nx, ny)
+        self._planner._origin = np.zeros(2, dtype=np.float64)
+        self._planner._resolution = res
+
+        self._mpc = MPCController()
+        self._mpc.configure(
+            MPCConfig(
+                horizon_s=1.6,
+                step_s=0.1,
+                # max_linear_vel here is the inner-NLP control limit; the
+                # *effective* speed cap is set externally via
+                # speed_limit_factor below so cable/slope feedback still
+                # modulates the rover. Use a generous internal cap.
+                max_linear_vel=1.5,
+                max_angular_vel=0.7,
+                update_rate_hz=int(round(1.0 / self._mpc_period_s)),
+                cable_tension_speed_limit_threshold_n=200.0,
+            )
+        )
+        # Pre-compute the speed factor that maps MPC's idealised 1.5 m/s
+        # flat-no-tension ceiling down to the balance-bot-safe ceiling. The
+        # factor preserves the SHAPE of get_speed_limit's slope+tension
+        # response (so the rover still visibly slows on rough or tense
+        # legs), just scaled to a ceiling the inverted pendulum can sustain.
+        baseline = self._mpc.get_speed_limit(0.0, 0.0)
+        self._speed_factor = self._BALANCE_SAFE_CEILING_MPS / max(baseline, 0.1)
+
+        # Plan the first leg now so the very first MPC call has a path.
+        self._current_path: Optional[PlannedPath] = None
+        self._plan_to(self._tour[self._tour_idx], from_xy=self._spawn)
+        self._mpc_failures = 0
+
+    # ------------------------------------------------------------------
+    # Map construction
+    # ------------------------------------------------------------------
+
+    def _mark_rocks_occupied(self) -> None:
+        """Stamp the world's rocks into the occupancy grid as obstacles."""
+        for rock in self._world._terrain.rock_positions:
+            rx, ry = float(rock[0]), float(rock[1])
+            radius = float(rock[3]) if len(rock) > 3 else 0.25
+            cx, cy = self._world.center
+            if np.hypot(rx - cx, ry - cy) < (WORLD_FLAT_RADIUS_M + 1.0):
+                # Rocks inside the spawn flat are skipped by the world too.
+                continue
+            r_cells = max(1, int(round((radius + 0.25) / self._occ.voxel_resolution_m)))
+            gx, gy = self._occ._world_to_grid(np.array([rx, ry]))
+            nx_, ny_ = self._occ.grid_shape
+            for dx in range(-r_cells, r_cells + 1):
+                for dy in range(-r_cells, r_cells + 1):
+                    if dx * dx + dy * dy > r_cells * r_cells:
+                        continue
+                    self._occ._update_cell(gx + dx, gy + dy, 5.0)
+
+    # ------------------------------------------------------------------
+    # Planning
+    # ------------------------------------------------------------------
+
+    def _plan_to(self, goal_xyz: np.ndarray, from_xy: np.ndarray) -> bool:
+        start = np.array([float(from_xy[0]), float(from_xy[1]), 0.0], dtype=np.float64)
+        try:
+            self._current_path = self._planner.plan(
+                start, goal_xyz, self._trav, self._cable_map
+            )
+            print(
+                f"  [nav] A* leg {self._tour_idx + 1}/{len(self._tour)}: "
+                f"({start[0]:.1f},{start[1]:.1f}) -> "
+                f"({goal_xyz[0]:.1f},{goal_xyz[1]:.1f})  "
+                f"{len(self._current_path.waypoints)} wp, "
+                f"{self._current_path.total_distance_m:.2f} m, "
+                f"risk={self._current_path.risk_score:.3f}"
+            )
+            return True
+        except ValueError as exc:
+            print(f"  [nav] planner failed: {exc}; falling back to direct line")
+            self._current_path = PlannedPath(
+                waypoints=[start, goal_xyz],
+                total_distance_m=float(np.linalg.norm(goal_xyz[:2] - start[:2])),
+                estimated_cable_drag_energy=0.0,
+                risk_score=0.0,
+            )
+            return False
+
+    # ------------------------------------------------------------------
+    # Feedback proxies
+    # ------------------------------------------------------------------
+
+    def cable_tension_n(self, pos_xy: np.ndarray) -> float:
+        d = float(np.linalg.norm(pos_xy[:2] - self._anchor))
+        over = max(0.0, d - self._CABLE_TAUT_M)
+        return float(min(self._CABLE_TENSION_MAX_N, self._CABLE_TENSION_PER_M * over))
+
+    def terrain_slope_deg(self, pos_xy: np.ndarray) -> float:
+        eps = 0.4
+        z0 = self._world.ground_z(float(pos_xy[0]), float(pos_xy[1]))
+        zx = self._world.ground_z(float(pos_xy[0] + eps), float(pos_xy[1]))
+        zy = self._world.ground_z(float(pos_xy[0]), float(pos_xy[1] + eps))
+        dzdx = (zx - z0) / eps
+        dzdy = (zy - z0) / eps
+        slope_m = math.hypot(dzdx, dzdy)
+        return float(math.degrees(math.atan(slope_m)))
+
+    # ------------------------------------------------------------------
+    # Step
+    # ------------------------------------------------------------------
+
+    def current_goal(self) -> np.ndarray:
+        return self._tour[self._tour_idx].copy()
+
+    def step(
+        self,
+        sim_t: float,
+        rover_pos: np.ndarray,
+        yaw: float,
+        body_v: float,
+    ) -> tuple[float, float, dict]:
+        info: dict = {}
+        # Advance waypoint if we've reached the current goal.
+        goal = self._tour[self._tour_idx]
+        dist_to_goal = float(np.linalg.norm(rover_pos[:2] - goal[:2]))
+        if dist_to_goal < self._waypoint_reach_m:
+            self._tour_idx = (self._tour_idx + 1) % len(self._tour)
+            self._plan_to(self._tour[self._tour_idx], from_xy=rover_pos[:2])
+            goal = self._tour[self._tour_idx]
+            info["leg_advanced"] = True
+
+        tension = self.cable_tension_n(rover_pos[:2])
+        slope = self.terrain_slope_deg(rover_pos[:2])
+        info["tension_n"] = tension
+        info["slope_deg"] = slope
+        info["goal_xy"] = (float(goal[0]), float(goal[1]))
+        info["leg_idx"] = self._tour_idx
+        info["dist_to_goal_m"] = dist_to_goal
+        info["v_max_mps"] = self._mpc.get_speed_limit(slope, tension)
+
+        # MPC at its configured period; in between, hold the last command.
+        if sim_t - self._last_mpc_t < self._mpc_period_s:
+            return self._last_v_cmd, self._last_w_cmd, info
+        self._last_mpc_t = sim_t
+
+        # Build [x, y, theta, v, omega] state for MPC.
+        current_state = np.array(
+            [float(rover_pos[0]), float(rover_pos[1]), float(yaw), float(body_v), 0.0],
+            dtype=np.float64,
+        )
+
+        ref_waypoints = self._current_path.waypoints if self._current_path is not None else [goal]
+        try:
+            out = self._mpc.compute(
+                current_state,
+                ref_waypoints,
+                cable_tension_n=tension,
+                terrain_slope_deg=slope,
+                speed_limit_factor=self._speed_factor,
+            )
+            v_cmd = float(out.linear_velocity)
+            w_cmd = float(out.angular_velocity)
+        except Exception as exc:  # noqa: BLE001 - keep the rover moving
+            self._mpc_failures += 1
+            info["mpc_error"] = str(exc)
+            # Fallback: simple proportional heading + speed toward goal,
+            # respecting the MPC speed limit so cable behaviour is preserved.
+            dx = float(goal[0] - rover_pos[0])
+            dy = float(goal[1] - rover_pos[1])
+            desired_yaw = math.atan2(dy, dx)
+            yaw_err = math.atan2(math.sin(desired_yaw - yaw), math.cos(desired_yaw - yaw))
+            v_limit = self._mpc.get_speed_limit(slope, tension) * self._speed_factor
+            if abs(yaw_err) > 0.5:
+                v_cmd = 0.05
+            else:
+                v_cmd = min(v_limit, 0.4 * max(0.0, dist_to_goal))
+            w_cmd = max(-0.6, min(0.6, 1.4 * yaw_err))
+
+        # Belt-and-braces clamp into a balancer-safe range.
+        v_cmd = max(-self._BALANCE_SAFE_CEILING_MPS,
+                    min(self._BALANCE_SAFE_CEILING_MPS, v_cmd))
+        w_cmd = max(-0.7, min(0.7, w_cmd))
+        self._last_v_cmd = v_cmd
+        self._last_w_cmd = w_cmd
+        info["v_cmd_mps"] = v_cmd
+        info["w_cmd_radps"] = w_cmd
+        info["mpc_failures"] = self._mpc_failures
+        return v_cmd, w_cmd, info
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1848,10 +2150,25 @@ def main() -> int:
         power.initialize(solar_cfg, battery_cfg, budget)
         if world is not None:
             world.print_summary()
+        # --navigation implies --capability-demo because the capability layer
+        # is what publishes cable / sensor / power telemetry the user wants to
+        # watch alongside the autonomous drive.
+        if args.navigation and not args.capability_demo:
+            args.capability_demo = True
         capability_demo = None
         if args.capability_demo:
             capability_demo = CapabilityShowcase(args, rover_yaml, profile)
             capability_demo.print_initial_status()
+
+        navigation: Optional[NavigationDriver] = None
+        if args.navigation:
+            if world is None:
+                print("  [nav] --navigation requires the lunar world scene; "
+                      "ignoring (flat-ground or headless).")
+            else:
+                navigation = NavigationDriver(world, spawn_xy, args.sim_hz)
+                print("  Navigation  : planner+MPC active — A* sets the tour, "
+                      "MPC tracks each leg, cable tension and slope feed the speed limit.")
 
         # Software arm: kinematics + grasp bookkeeping; the URDF chain mirrors it.
         arm = SerialArm()
@@ -1945,6 +2262,7 @@ def main() -> int:
             engine, drive, wheel_actuator, power, arm, arm_bridge, balance,
             keyboard, cfg, args, spawn_z, capability_demo,
             world=world, spawn_xy=spawn_xy, viewer_controls=viewer_controls,
+            navigation=navigation,
         )
         completed_cleanly = True
 
@@ -1985,6 +2303,7 @@ def run_loop(
     world: Optional[LunarWorld] = None,
     spawn_xy: tuple[float, float] = (0.0, 0.0),
     viewer_controls: Optional[ViewerControls] = None,
+    navigation: Optional[NavigationDriver] = None,
 ) -> None:
     dt = cfg.timestep
     step_count = 0
@@ -2000,6 +2319,8 @@ def run_loop(
     jog_step = 0.05  # radians per keypress
     v_step = 0.2  # m/s per W/S press
     w_step = 0.3  # rad/s per A/D press
+    next_nav_report_wall = 0.0
+    last_nav_info: dict = {}
 
     while True:
         t = engine.get_sim_time()
@@ -2099,6 +2420,11 @@ def run_loop(
         # Forward ground velocity from the wheel encoders.
         body_v = wheel_actuator.body_velocity()
 
+        # Navigation: planner+MPC drive v_user / w_user instead of the
+        # keyboard or the scripted self-test sequence above.
+        if navigation is not None:
+            v_user, w_user, last_nav_info = navigation.step(t, rover_pos, yaw, body_v)
+
         tau_left, tau_right = balance.step(
             pitch_rad=pitch,
             body_v_mps=body_v,
@@ -2186,6 +2512,21 @@ def run_loop(
                 soc=power.get_battery_soc(),
             )
             next_report_wall = now + 0.5  # 2 Hz console telemetry
+
+        if navigation is not None and last_nav_info and now >= next_nav_report_wall:
+            gx, gy = last_nav_info.get("goal_xy", (0.0, 0.0))
+            tension_n = last_nav_info.get("tension_n", 0.0)
+            slope_deg = last_nav_info.get("slope_deg", 0.0)
+            v_max = last_nav_info.get("v_max_mps", 0.0)
+            d = last_nav_info.get("dist_to_goal_m", 0.0)
+            leg = last_nav_info.get("leg_idx", 0)
+            print(
+                f"  nav | leg {leg + 1}/{len(navigation._tour)} -> "
+                f"({gx:5.2f},{gy:5.2f}) d={d:4.2f}m | "
+                f"cable={tension_n:5.1f}N slope={slope_deg:4.1f}deg | "
+                f"v_max={v_max:.2f} v_cmd={v_user:+.2f} w_cmd={w_user:+.2f}"
+            )
+            next_nav_report_wall = now + 1.0  # 1 Hz nav telemetry
 
         # Safety: if the rover falls flat, call it out — balance controller failed.
         if abs(pitch) > math.radians(70.0) or abs(roll) > math.radians(70.0):

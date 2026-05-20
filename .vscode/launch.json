@@ -1,0 +1,118 @@
+{
+  // F5 launches the first configuration in this list. The top entry is the
+  // autonomous navigation demo: A* planner + MPC drive the rover around a
+  // tour of the lunar scene while the trailing cable visibly slows it down
+  // whenever the leash pulls taut.
+  //
+  // The Python interpreter is the project's pinned virtualenv at
+  // C:\ve\.genesis (see CLAUDE.md). All commands and entry points expect
+  // this venv to be activated; the configurations below set it explicitly
+  // via `python` so F5 works whether or not the user has remembered to
+  // activate it first.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Rover demo - navigation (planner+MPC, GPU)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\scripts\\demo_rover_drive.py",
+      "python": "C:\\ve\\.genesis\\Scripts\\python.exe",
+      "args": [
+        "--navigation",
+        "--capability-demo",
+        "--backend", "gpu",
+        "--sim-hz", "120",
+        "--render-hz", "60"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}\\src"
+      }
+    },
+    {
+      "name": "Rover demo - navigation (planner+MPC, CPU)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\scripts\\demo_rover_drive.py",
+      "python": "C:\\ve\\.genesis\\Scripts\\python.exe",
+      "args": [
+        "--navigation",
+        "--capability-demo",
+        "--backend", "cpu",
+        "--sim-hz", "120",
+        "--render-hz", "60"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}\\src"
+      }
+    },
+    {
+      "name": "Rover demo - scripted self-test (CPU)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\scripts\\demo_rover_drive.py",
+      "python": "C:\\ve\\.genesis\\Scripts\\python.exe",
+      "args": [
+        "--self-test",
+        "--capability-demo",
+        "--backend", "cpu"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}\\src"
+      }
+    },
+    {
+      "name": "Rover demo - manual keyboard drive (CPU)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\scripts\\demo_rover_drive.py",
+      "python": "C:\\ve\\.genesis\\Scripts\\python.exe",
+      "args": [
+        "--capability-demo",
+        "--backend", "cpu"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}\\src"
+      }
+    },
+    {
+      "name": "Validate navigation (text, no viewer)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\scripts\\validate_navigation.py",
+      "python": "C:\\ve\\.genesis\\Scripts\\python.exe",
+      "args": ["--steps", "60"],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}\\src"
+      }
+    },
+    {
+      "name": "Physics verifier (box launcher, CPU)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\scripts\\verify_physics.py",
+      "python": "C:\\ve\\.genesis\\Scripts\\python.exe",
+      "args": [],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}\\src"
+      }
+    }
+  ]
+}
