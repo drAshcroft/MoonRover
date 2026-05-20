@@ -2548,10 +2548,15 @@ def run_loop(
         # Forward ground velocity from the wheel encoders.
         body_v = wheel_actuator.body_velocity()
 
-        # Navigation: planner+MPC drive v_user / w_user instead of the
-        # keyboard or the scripted self-test sequence above.
+        # Navigation: planner+MPC drive v_user / w_user *only once started*.
+        # While the driver is ARMED (after --navigation but before F5),
+        # navigation.step() still updates telemetry but the keyboard
+        # commands stay in control so the operator can drive manually and
+        # verify the balancer is stable before engaging autonomy.
         if navigation is not None:
-            v_user, w_user, last_nav_info = navigation.step(t, rover_pos, yaw, body_v)
+            nav_v, nav_w, last_nav_info = navigation.step(t, rover_pos, yaw, body_v)
+            if navigation.is_started():
+                v_user, w_user = nav_v, nav_w
 
         tau_left, tau_right = balance.step(
             pitch_rad=pitch,
