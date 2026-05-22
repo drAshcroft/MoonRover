@@ -9,11 +9,25 @@ deployment rate based on terrain and cable conditions.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 
-from moon_rover.rl.common.policy_interface import PolicyInterface
+from moon_rover.rl.common.policy_interface import BasePolicy, PolicyInterface, PolicyMode
+
+
+def _field(obs: Any, name: str, default: Any = None) -> Any:
+    if isinstance(obs, dict):
+        return obs.get(name, default)
+    return getattr(obs, name, default)
+
+
+def _scalar(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    arr = np.asarray(value, dtype=np.float64).ravel()
+    return float(arr[0]) if arr.size else default
 
 
 @dataclass
@@ -79,18 +93,69 @@ class CableDeployAction:
     tension_advisory: npt.NDArray[np.float32]  # shape (1,), [0, 1]
 
 
-class CableDeploymentPolicy(PolicyInterface):
+class CableDeploymentPolicy(BasePolicy):
+    """Scripted cable-spool controller (tension feedback + snag avoidance).
+
+    Deterministic baseline. Each tick it pays cable out to match rover motion,
+    then corrects for tension and obstacle proximity:
+
+    1. Feed-forward: nominal feed tracks ``rover_speed`` so cable neither piles
+       up nor goes taut from the rover simply driving.
+    2. Tension regulation: above ``high_tension_n`` it brakes (negative feed)
+       to relieve a snag; below ``low_tension_n`` it may pay out faster.
+    3. Snag avoidance: when the nearest ``rock_proximity`` drops below
+       ``snag_clearance_m`` it slows the feed to avoid wrapping a rock.
+
+    Outputs a feed modifier in [-1, 1] and a tension advisory in [0, 1].
     """
-    Policy for cable spool deployment control.
 
-    Implements the PolicyInterface for cable deployment task. Both scripted
-    and RL implementations provide identical observe/act interface.
+    def __init__(
+        self,
+        *,
+        max_feed_mps: float = 0.5,
+        low_tension_n: float = 100.0,
+        high_tension_n: float = 400.0,
+        snag_clearance_m: float = 0.3,
+    ) -> None:
+        super().__init__(
+            mode=PolicyMode.SCRIPTED,
+            confidence=1.0,
+            supported_modes={PolicyMode.SCRIPTED, PolicyMode.FALLBACK},
+        )
+        self.max_feed_mps = float(max_feed_mps)
+        self.low_tension_n = float(low_tension_n)
+        self.high_tension_n = float(high_tension_n)
+        self.snag_clearance_m = float(snag_clearance_m)
 
-    RL policy learns tension regulation, snag avoidance, and deployment
-    optimization through interaction. Scripted policy uses tension feedback
-    control with speed limits based on rover motion.
+    def _compute_action(self, observation: Any) -> dict[str, npt.NDArray]:
+        tension = _scalar(_field(observation, "tension"), 0.0)
+        rover_speed = _scalar(_field(observation, "rover_speed"), 0.0)
+        rock_prox = np.asarray(
+            _field(observation, "rock_proximity", [np.inf, np.inf, np.inf, np.inf]),
+            dtype=np.float64,
+        ).ravel()
+        nearest = float(rock_prox.min()) if rock_prox.size else float("inf")
 
-    See PolicyInterface for full method documentation.
-    """
+        # Feed-forward: pay out at rover speed (normalized by max feed).
+        feed = rover_speed / self.max_feed_mps
 
-    pass
+        # Tension regulation.
+        if tension > self.high_tension_n:
+            feed = -1.0  # brake hard to relieve the snag
+        elif tension < self.low_tension_n:
+            feed += 0.2  # safe to pay out a little faster
+
+        # Snag avoidance near rocks.
+        if nearest < self.snag_clearance_m:
+            feed = min(feed, 0.0)
+
+        feed = float(np.clip(feed, -1.0, 1.0))
+
+        # Tension advisory: target the mid-band as a fraction of [low, high].
+        mid = 0.5 * (self.low_tension_n + self.high_tension_n)
+        advisory = float(np.clip(mid / max(self.high_tension_n, 1e-6), 0.0, 1.0))
+
+        return {
+            "spool_feed_modifier": np.array([feed], dtype=np.float32),
+            "tension_advisory": np.array([advisory], dtype=np.float32),
+        }

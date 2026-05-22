@@ -9,11 +9,18 @@ by conservative stability maintenance during transit.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 
-from moon_rover.rl.common.policy_interface import PolicyInterface
+from moon_rover.rl.common.policy_interface import BasePolicy, PolicyInterface, PolicyMode
+
+
+def _field(obs: Any, name: str, default: Any = None) -> Any:
+    if isinstance(obs, dict):
+        return obs.get(name, default)
+    return getattr(obs, name, default)
 
 
 @dataclass
@@ -110,41 +117,94 @@ class CarryStableAction:
     joint_velocity_targets: npt.NDArray[np.float32]  # shape (4,), [-0.05, 0.05]
 
 
-class PickupPolicy(PolicyInterface):
-    """
-    Policy for antenna pickup manipulation.
+class PickupPolicy(BasePolicy):
+    """Scripted antenna-pickup controller (reactive reach + force grasp).
 
-    Implements the PolicyInterface for antenna pickup task. Both scripted
-    and RL implementations provide identical observe/act interface.
+    Deterministic baseline implementing a two-stage reach-and-grasp:
 
-    RL policy learns contact-rich manipulation with visual servoing to
-    locate and grasp antenna. Scripted policy uses reactive reaching and
-    force-feedback grasping.
+    1. Reach: drive joint velocities to reduce the positional error in
+       ``antenna_relative_pose`` (first three components, the gripper-frame
+       offset to the antenna). A 4-DOF Jacobian-free heuristic maps the
+       dominant Cartesian error onto base/shoulder/elbow joints.
+    2. Grasp: once the antenna is within ``grasp_tolerance_m`` the gripper
+       command latches closed (1.0); otherwise it stays open (0.0).
 
-    High-dimensional observation space (1039+ dims) including 32x32 depth
-    image requires CNN feature extraction or visual transformer architecture.
-
-    See PolicyInterface for full method documentation.
+    :attr:`grasp_closed` records whether the gripper has latched.
     """
 
-    pass
+    def __init__(self, *, grasp_tolerance_m: float = 0.05, k_reach: float = 5.0) -> None:
+        super().__init__(
+            mode=PolicyMode.SCRIPTED,
+            confidence=1.0,
+            supported_modes={PolicyMode.SCRIPTED, PolicyMode.FALLBACK},
+        )
+        self.grasp_tolerance_m = float(grasp_tolerance_m)
+        self.k_reach = float(k_reach)
+        self.grasp_closed: bool = False
+
+    def reset(self) -> None:
+        super().reset()
+        self.grasp_closed = False
+
+    def _compute_action(self, observation: Any) -> dict[str, npt.NDArray]:
+        pose = np.asarray(
+            _field(observation, "antenna_relative_pose", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            dtype=np.float64,
+        ).ravel()
+        offset = pose[:3]
+        dist = float(np.linalg.norm(offset))
+
+        if dist <= self.grasp_tolerance_m:
+            self.grasp_closed = True
+
+        if self.grasp_closed:
+            joint_targets = np.zeros(4, dtype=np.float32)
+            gripper = 1.0
+        else:
+            # Reach: base yaws toward dx/dy, shoulder/elbow drive dz + reach.
+            base = np.clip(self.k_reach * np.arctan2(offset[1], offset[0] + 1e-6), -1.0, 1.0)
+            reach = np.clip(self.k_reach * float(np.hypot(offset[0], offset[1])), -1.0, 1.0)
+            lift = np.clip(self.k_reach * offset[2], -1.0, 1.0)
+            joint_targets = np.array([base, reach, -reach, lift], dtype=np.float32)
+            gripper = 0.0
+
+        return {
+            "joint_velocity_targets": joint_targets,
+            "gripper_command": np.array([gripper], dtype=np.float32),
+        }
 
 
-class CarryStablePolicy(PolicyInterface):
+class CarryStablePolicy(BasePolicy):
+    """Scripted carry-stability controller (impedance damping).
+
+    Deterministic baseline that keeps the carried antenna steady during
+    transit. It opposes residual joint motion and counteracts chassis
+    disturbances sensed by the IMU gyro, with commands tightly bounded to
+    ``max_joint_rate`` (default ±0.05 rad/s) to prevent swinging.
     """
-    Policy for antenna carry stability control.
 
-    Implements the PolicyInterface for carry-stable task. Both scripted
-    and RL implementations provide identical observe/act interface.
+    def __init__(self, *, max_joint_rate: float = 0.05, k_damp: float = 0.8, k_gyro: float = 0.3) -> None:
+        super().__init__(
+            mode=PolicyMode.SCRIPTED,
+            confidence=1.0,
+            supported_modes={PolicyMode.SCRIPTED, PolicyMode.FALLBACK},
+        )
+        self.max_joint_rate = float(max_joint_rate)
+        self.k_damp = float(k_damp)
+        self.k_gyro = float(k_gyro)
 
-    RL policy learns compliant arm control that absorbs terrain disturbances
-    and prevents antenna swinging. Scripted policy uses impedance control
-    tuned for stability over speed.
+    def _compute_action(self, observation: Any) -> dict[str, npt.NDArray]:
+        joint_vel = np.asarray(
+            _field(observation, "joint_vel", [0.0, 0.0, 0.0, 0.0]), dtype=np.float64
+        ).ravel()[:4]
+        if joint_vel.size < 4:
+            joint_vel = np.pad(joint_vel, (0, 4 - joint_vel.size))
+        gyro = np.asarray(
+            _field(observation, "chassis_gyro", [0.0, 0.0, 0.0]), dtype=np.float64
+        ).ravel()
 
-    Low-dimensional observation space (22 dims) enables fast training and
-    efficient inference for safety-critical carry phase.
-
-    See PolicyInterface for full method documentation.
-    """
-
-    pass
+        # Damp residual joint motion; add a gyro-driven counter-disturbance term.
+        disturbance = float(np.linalg.norm(gyro)) if gyro.size else 0.0
+        cmd = -self.k_damp * joint_vel - self.k_gyro * disturbance * np.sign(joint_vel)
+        cmd = np.clip(cmd, -self.max_joint_rate, self.max_joint_rate)
+        return {"joint_velocity_targets": cmd.astype(np.float32)}

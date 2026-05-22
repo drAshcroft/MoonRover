@@ -8,11 +8,26 @@ Learns contact-rich manipulation with force feedback for robust surface placemen
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 
-from moon_rover.rl.common.policy_interface import PolicyInterface
+from moon_rover.rl.common.policy_interface import BasePolicy, PolicyInterface, PolicyMode
+
+
+def _field(obs: Any, name: str, default: Any = None) -> Any:
+    """Read a field from either a dataclass observation or a plain dict."""
+    if isinstance(obs, dict):
+        return obs.get(name, default)
+    return getattr(obs, name, default)
+
+
+def _scalar(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    arr = np.asarray(value, dtype=np.float64).ravel()
+    return float(arr[0]) if arr.size else default
 
 
 @dataclass
@@ -98,17 +113,63 @@ class PlacementReward:
     pass
 
 
-class AntennaPlacementPolicy(PolicyInterface):
+class AntennaPlacementPolicy(BasePolicy):
+    """Scripted antenna-placement controller (impedance + force feedback).
+
+    Deterministic baseline used as a fallback and an RL training reference.
+    Behaviour:
+
+    1. Descend while ``height_above_surface`` exceeds ``contact_height_m`` —
+       command negative vertical velocity proportional to the height error.
+    2. On contact, regulate the normal force to ``target_force_n``: keep
+       lowering while under-force, retract while over-force (impedance law).
+    3. Align the wrist with ``surface_normal`` so the base plate seats flat.
+
+    The dominant vertical command is exposed via :attr:`last_vertical_rate`
+    (negative = lowering) for introspection and testing. Actions are 4 joint
+    velocity targets normalized to [-1, 1].
     """
-    Policy for antenna placement arm control.
 
-    Implements the PolicyInterface for antenna placement task. Both scripted
-    and RL implementations provide identical observe/act interface.
+    def __init__(
+        self,
+        *,
+        target_force_n: float = 120.0,
+        contact_height_m: float = 0.02,
+        k_height: float = 4.0,
+        k_force: float = 0.01,
+    ) -> None:
+        super().__init__(
+            mode=PolicyMode.SCRIPTED,
+            confidence=1.0,
+            supported_modes={PolicyMode.SCRIPTED, PolicyMode.FALLBACK},
+        )
+        self.target_force_n = float(target_force_n)
+        self.contact_height_m = float(contact_height_m)
+        self.k_height = float(k_height)
+        self.k_force = float(k_force)
+        self.last_vertical_rate: float = 0.0
 
-    RL policy learns contact-rich manipulation through interaction. Scripted
-    policy uses impedance control and force feedback heuristics.
+    def _compute_action(self, observation: Any) -> dict[str, npt.NDArray]:
+        height = _scalar(_field(observation, "height_above_surface"), 0.0)
+        fz = float(np.asarray(_field(observation, "ft_force", [0.0, 0.0, 0.0])).ravel()[2])
+        normal = np.asarray(
+            _field(observation, "surface_normal", [0.0, 0.0, 1.0]), dtype=np.float64
+        ).ravel()
 
-    See PolicyInterface for full method documentation.
-    """
+        if height > self.contact_height_m:
+            # Above the surface: descend proportionally to the height error.
+            vertical = -np.clip(self.k_height * height, 0.0, 1.0)
+        else:
+            # In contact: impedance law on the normal force. Under-force
+            # (fz < target) keeps pushing down (negative); over-force retracts.
+            force_err = self.target_force_n - fz
+            vertical = float(np.clip(-self.k_force * force_err, -1.0, 1.0))
+        self.last_vertical_rate = float(vertical)
 
-    pass
+        # Wrist alignment: roll the last joint toward the surface-normal tilt.
+        tilt = float(np.arctan2(float(normal[0]), max(float(normal[2]), 1e-6)))
+        wrist = float(np.clip(-tilt, -1.0, 1.0))
+
+        # Map vertical command onto shoulder + elbow, alignment onto the wrist.
+        targets = np.array([0.0, vertical, vertical, wrist], dtype=np.float32)
+        return {"joint_velocity_targets": targets}
