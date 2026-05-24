@@ -106,10 +106,14 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Scripted cable-deployment demo")
     p.add_argument("--no-viewer", action="store_true",
                    help="Headless mode (no 3-D window).")
-    p.add_argument("--sim-hz", type=float, default=120.0,
+    p.add_argument("--sim-hz", type=float, default=60.0,
                    help="Physics rate (Hz).")
-    p.add_argument("--render-hz", type=int, default=60,
+    p.add_argument("--control-hz", type=float, default=30.0,
+                   help="Python control-command rate (Hz).")
+    p.add_argument("--render-hz", type=int, default=30,
                    help="Viewer refresh cap (Hz).")
+    p.add_argument("--target-rtf", type=float, default=1.0,
+                   help="Viewer pacing target real-time factor (<=0 = unpaced).")
     p.add_argument("--backend", choices=("cpu", "gpu"), default="cpu",
                    help="Genesis backend.")
     p.add_argument("--max-sim-seconds", type=float, default=0.0,
@@ -291,6 +295,7 @@ class CableWorld:
             self._base_xy + np.array([4.5, -1.2]),
             self._base_xy + np.array([1.5, -3.5]),
         ][:INSPECTION_BEACON_COUNT]
+        self._frozen_cable_visuals: set[int] = set()
 
     # ----- terrain helpers --------------------------------------------------
     @property
@@ -432,8 +437,6 @@ class CableWorld:
                pos: np.ndarray, quat: np.ndarray) -> None:
         try:
             engine.set_body_pose(name, pos.astype(np.float32), quat)
-            engine.set_body_velocity(name, np.zeros(3, np.float32),
-                                     np.zeros(3, np.float32))
         except Exception:  # noqa: BLE001
             pass
 
@@ -450,14 +453,9 @@ class CableWorld:
         - DEPLOYED: drape links along the recorded path; let any leftover hide.
         """
         if reel.state is CableReelState.STORED:
-            # Tuck links underground so they're not visible.
-            for k in range(reel.link_count):
-                self._place(
-                    engine,
-                    reel.link_name(k),
-                    np.array([reel.post_xy[0], reel.post_xy[1], -50.0 - k]),
-                    _yaw_quat(0.0),
-                )
+            # Links are created underground. Re-parking them every physics tick
+            # is surprisingly expensive because each pose set crosses into
+            # Genesis, so leave stored reels alone.
             return
 
         if reel.state is CableReelState.BEING_PULLED:
@@ -469,11 +467,14 @@ class CableWorld:
             return
 
         if reel.state is CableReelState.DEPLOYED:
+            if reel.index in self._frozen_cable_visuals:
+                return
             path = reel.deployed_path or []
             if len(path) < 2:
                 # Degenerate: nothing to lay down.
                 return
             self._drape_links_along_path(engine, reel, path)
+            self._frozen_cable_visuals.add(reel.index)
             return
 
     def _drape_links_straight(self, engine: GenesisPhysicsEngine,
@@ -723,11 +724,14 @@ class CableDeployController:
     RETREAT_DISTANCE_M = 0.6
     SETTLE_SECONDS = 1.5
 
-    # Standoff distance from the reel post when grasping the cable. The arm
-    # base is +0.5 m forward of chassis center, the reach is ~2 m, and we want
-    # the handle (0.75 m off ground) inside a comfortable forward-low pose,
-    # so park the chassis ~0.9 m from the reel.
-    REEL_STANDOFF_M = 1.10
+    # Standoff distance from the reel post when grasping the cable. The
+    # four_wheel_skid chassis is 2.0 m long, so anything tighter than ~1.8 m
+    # leaves the chassis front overlapping the reel post — during the
+    # in-place align rotation the rover drifts a few decimetres laterally
+    # and can wedge itself against the post. 1.8 m keeps the chassis front
+    # clear, and the 2.0 m arm reach still puts the gripper over the cable
+    # handle (arm base sits +0.5 m forward of chassis center).
+    REEL_STANDOFF_M = 1.80
 
     def __init__(self, world: CableWorld, arm: SerialArm) -> None:
         self._world = world
@@ -854,7 +858,12 @@ class CableDeployController:
         # the rover always creeps toward its goal while it corrects yaw.
         v_scale = max(0.25, math.cos(yaw_err))
         v = self.DRIVE_SPEED_MPS * v_scale * min(1.0, dist / 0.7)
-        w = float(np.clip(2.0 * yaw_err, -self.TURN_SPEED_RADPS,
+        # Sign flip on the yaw command compensates for the four_wheel_skid
+        # profile in configs/rover.yaml mounting "front_left_wheel" at -Y
+        # while the drive IK assumes left=+Y (ROS REP-103). A positive yaw
+        # rate command therefore rotates the physical rover clockwise, so we
+        # negate the controller's intent here. Localised to this demo.
+        w = float(np.clip(-2.0 * yaw_err, -self.TURN_SPEED_RADPS,
                           self.TURN_SPEED_RADPS))
         return DriveCommand(linear_velocity_mps=v, angular_velocity_radps=w)
 
@@ -870,7 +879,10 @@ class CableDeployController:
         err = _wrap_pi(target_yaw - yaw)
         if abs(err) < self.YAW_TOL_RAD:
             return DriveCommand(0.0, 0.0), True
-        w = float(np.clip(1.4 * err, -self.TURN_SPEED_RADPS,
+        # Sign-flip explanation: see _drive_toward. The four_wheel_skid
+        # profile mounts left-named wheels on the -Y side, inverting the
+        # drive IK's yaw sense relative to ROS convention.
+        w = float(np.clip(-1.4 * err, -self.TURN_SPEED_RADPS,
                           self.TURN_SPEED_RADPS))
         return DriveCommand(0.0, w), False
 
@@ -908,6 +920,14 @@ class CableDeployController:
                        yaw: float) -> DriveCommand:
         self._hold_arm_with_bob(ARM_STOW, sim_t)
         assert self._target_yaw is not None
+        # Skid-steer rotation on lunar regolith pushes the chassis sideways
+        # by a few decimetres while it spins; if we're already within ~15° of
+        # the target heading, accept the alignment now rather than risk
+        # drifting into the reel post.
+        if abs(_wrap_pi(self._target_yaw - yaw)) < math.radians(15.0):
+            self._begin_slew(ARM_REACH_FORWARD_LOW, sim_t, duration=2.2)
+            self._enter(Phase.ARM_REACH, sim_t)
+            return DriveCommand(0.0, 0.0)
         cmd, done = self._rotate_to(yaw, self._target_yaw)
         if done:
             self._begin_slew(ARM_REACH_FORWARD_LOW, sim_t, duration=2.2)
@@ -1241,6 +1261,13 @@ def print_header(args: argparse.Namespace, num_reels: int) -> None:
     print("=" * 92)
     print(f"  Profile     : {PROFILE_NAME} (4-wheel skid steer, stable platform)")
     print(f"  Backend     : {args.backend.upper()}  sim @ {args.sim_hz:.0f} Hz")
+    print(f"  Control     : Python commands @ {args.control_hz:.0f} Hz")
+    if not args.no_viewer:
+        pacing = (
+            f"{args.target_rtf:.2f}x real time"
+            if args.target_rtf > 0.0 else "unpaced"
+        )
+        print(f"  Viewer      : render @ {args.render_hz:d} Hz, pacing {pacing}")
     print(f"  Cables      : {num_reels} reels to deploy from the moonbase")
     print("  Controller  : scripted state machine (no RL, no MPC)")
     if args.backend == "gpu":
@@ -1380,7 +1407,12 @@ def main() -> int:
         step_count = 0
         wall_start = time.perf_counter()
         next_report_wall = wall_start
-        pace_to_real_time = not args.no_viewer
+        control_hz = args.control_hz if args.control_hz > 0.0 else args.sim_hz
+        control_interval_steps = max(1, int(round((1.0 / control_hz) / dt)))
+        render_hz = max(1, int(args.render_hz))
+        render_interval_steps = max(1, int(round((1.0 / render_hz) / dt)))
+        pace_to_real_time = not args.no_viewer and args.target_rtf > 0.0
+        last_control_step: Optional[int] = None
         done_at_sim_t: Optional[float] = None
         last_logged_phase: Optional[Phase] = None
 
@@ -1397,26 +1429,46 @@ def main() -> int:
             grip_world = gripper_world_xyz(arm, rover_pos, yaw)
 
             # Controller step (updates arm joint targets and reel state).
+            phase_before_update = controller.phase
             drive_cmd = controller.update(t, rover_pos, yaw, grip_world)
+            phase_changed = controller.phase is not phase_before_update
 
             # Apply commands.
-            drive.command(drive_cmd)
-            drive.update(dt)
             arm.update(dt)
-            arm_bridge.sync()
+            should_control = (
+                step_count % control_interval_steps == 0
+                or phase_changed
+                or controller.phase is Phase.DONE
+            )
+            if should_control:
+                control_steps = (
+                    1 if last_control_step is None
+                    else max(1, step_count - last_control_step)
+                )
+                drive.command(drive_cmd)
+                drive.update(dt * control_steps)
+                arm_bridge.sync()
+                last_control_step = step_count
+
+            should_render = (
+                not args.no_viewer
+                and step_count % render_interval_steps == 0
+            )
+
+            if should_render:
+                for reel in world.reels:
+                    controller_grip = grip_world if (
+                        reel.state is CableReelState.BEING_PULLED
+                        and reel is world.reels[
+                            controller._reel_idx
+                            if controller._reel_idx < len(world.reels)
+                            else 0
+                        ]
+                    ) else None
+                    world.update_cable_visual(engine, reel, controller_grip)
 
             # Step physics.
-            engine.step(dt, render=not args.no_viewer)
-
-            # Refresh cable visuals for all reels (cheap; ~108 boxes total).
-            for reel in world.reels:
-                controller_grip = grip_world if (
-                    reel.state is CableReelState.BEING_PULLED
-                    and reel is world.reels[controller._reel_idx
-                                             if controller._reel_idx < len(world.reels)
-                                             else 0]
-                ) else None
-                world.update_cable_visual(engine, reel, controller_grip)
+            engine.step(dt, render=should_render)
 
             step_count += 1
 
@@ -1431,7 +1483,10 @@ def main() -> int:
             # like DRIVE_TO_REEL show progress without flooding stdout.
             now = time.perf_counter()
             if now >= next_report_wall:
+                wall_elapsed = max(now - wall_start, 1e-9)
+                rtf = t / wall_elapsed
                 print(f"  t={t:6.2f}s  step={step_count:5d}  "
+                      f"rtf={rtf:4.2f}x  "
                       f"pos=({rover_pos[0]:+5.2f},{rover_pos[1]:+5.2f})  "
                       f"yaw={math.degrees(yaw):+6.1f} deg  "
                       f"{controller.status_line}  "
@@ -1461,10 +1516,15 @@ def main() -> int:
 
             # Real-time pacing for the viewer.
             if pace_to_real_time:
-                target_wall = wall_start + step_count * dt
+                target_wall = wall_start + (step_count * dt) / args.target_rtf
                 sleep_for = target_wall - time.perf_counter()
                 if sleep_for > 0.0005:
                     time.sleep(sleep_for)
+
+        sim_wall = max(time.perf_counter() - wall_start, 1e-9)
+        sim_t = engine.get_sim_time()
+        print(f"  Sim loop   : {sim_t:.2f}s sim in {sim_wall:.2f}s wall "
+              f"(rtf={sim_t / sim_wall:.2f}x, steps={step_count})")
 
     except KeyboardInterrupt:
         print("\n  Stopped by user (Ctrl+C).")
