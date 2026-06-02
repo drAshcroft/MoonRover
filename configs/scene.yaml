@@ -151,10 +151,10 @@ mission:
 
   # Mission type
   # Options: exploration, deployment, retrieval, communication_relay
-  mission_type: exploration
+  mission_type: deployment
 
   # Mission name (for logging and identification)
-  mission_name: Lunar Base Survey Mission
+  mission_name: Lunar Interferometric Array Construction
 
   # Target waypoints for rover navigation (optional override)
   # If not specified, uses waypoints from mission.yaml grid

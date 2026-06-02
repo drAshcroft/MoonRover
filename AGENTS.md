@@ -119,6 +119,11 @@ C:\ve\.genesis\Scripts\python.exe scripts\demo_cable_pull.py --backend gpu
   zero-filled normals when the backend does not provide them.
 - Contact queries support both real Genesis 0.4.4 entity contact dictionaries
   and the older mock scene-level object-list path used by unit tests.
+- Runtime rigid attachments use a deterministic kinematic-follow fallback:
+  `attach_bodies(parent, child)` preserves the current relative transform and
+  slaves the child pose/velocity before and after each step until
+  `detach_bodies(handle)`. Attachment state is snapshot-safe. Genesis 0.4.4
+  does not expose a stable runtime weld API through the local adapter.
 
 ### Terrain And Contact Semantics
 

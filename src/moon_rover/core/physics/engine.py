@@ -41,6 +41,13 @@ class ScenePhase(Enum):
     TEARDOWN = "teardown"
 
 
+@dataclass(frozen=True)
+class AttachmentHandle:
+    """Opaque handle for a runtime rigid-body attachment."""
+
+    attachment_id: str
+
+
 @dataclass
 class GenesisConfig:
     """Configuration for Genesis physics engine.
@@ -211,6 +218,20 @@ class PhysicsEngine(ABC):
             RuntimeError: If called outside SIMULATION phase.
             ValueError: If snapshot data is corrupted or incompatible.
         """
+        raise NotImplementedError
+
+    @abstractmethod
+    def attach_bodies(self, parent: str, child: str) -> AttachmentHandle:
+        """Rigidly attach a child body to a parent body at its current pose.
+
+        The child retains its current world-frame pose at attach time and then
+        follows the parent's relative transform until detached.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def detach_bodies(self, handle: AttachmentHandle) -> None:
+        """Release a previously attached child body."""
         raise NotImplementedError
 
     @abstractmethod

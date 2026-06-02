@@ -1,6 +1,6 @@
 # Moon Rover Mission Configuration
 # Per System 12 - Mission Grid, Deployment, and Success Criteria
-# This file defines the exploration grid layout, rover deployment strategy,
+# This file defines the interferometric array layout, rover deployment strategy,
 # deployment cable parameters, and mission success criteria.
 
 # ============================================================================
@@ -9,16 +9,16 @@
 
 mission:
   # Unique mission identifier
-  mission_id: lunar_exploration_001
+  mission_id: lunar_interferometer_build_001
 
   # Mission name for logging and identification
-  mission_name: "Lunar Surface Exploration Grid"
+  mission_name: "Lunar Interferometric Array Construction"
 
   # Mission description
-  description: "Multi-rover exploration mission with tethered deployment from moonbase station"
+  description: "Multi-rover construction of a surveyed tethered interferometric antenna array"
 
   # Mission type: exploration, deployment, retrieval, communication_relay, sample_collection
-  mission_type: exploration
+  mission_type: deployment
 
   # Start time (simulation seconds from epoch)
   # 0 = start immediately
@@ -69,6 +69,37 @@ grid:
 
   # Automatically generate waypoints for all grid cells
   auto_generate_waypoints: true
+
+
+# ============================================================================
+# INTERFEROMETRIC ARRAY PRODUCT DEFINITION
+# ============================================================================
+
+array:
+  array_id: lunar_interferometer_001
+  reference_origin_xyz: [50.0, 50.0, 0.0]
+
+  # Survey tolerances used to determine whether coherent baselines are usable.
+  placement_tolerance_m: 0.25
+  tilt_tolerance_deg: 5.0
+  baseline_tolerance_m: 0.50
+
+  # The grid section generates the initial 4x5 surveyed layout. Explicit
+  # elements/baselines can replace it for non-grid science configurations.
+  operating_band:
+    center_frequency_hz: 30000000.0
+    bandwidth_hz: 10000000.0
+    polarization: dual_linear
+
+  commissioning:
+    topology: home_run_umbilical
+    timing_distribution: fiber
+    data_transport: fiber
+    power_distribution: umbilical
+    require_connector_lock: true
+    require_timing_lock: true
+    require_data_link: true
+    require_power_good: true
 
 
 # ============================================================================

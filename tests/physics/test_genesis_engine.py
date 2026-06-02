@@ -12,7 +12,12 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from moon_rover.core.physics.engine import GenesisConfig, GenesisPhysicsEngine, ScenePhase
+from moon_rover.core.physics.engine import (
+    AttachmentHandle,
+    GenesisConfig,
+    GenesisPhysicsEngine,
+    ScenePhase,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +724,82 @@ class TestSnapshot:
 
 
 # ---------------------------------------------------------------------------
+# Runtime rigid attachments
+# ---------------------------------------------------------------------------
+
+class TestAttachments:
+
+    @staticmethod
+    def _engine_with_pair(mock_genesis):
+        gs_mock, _ = mock_genesis
+        engine = _make_engine(mock_genesis)
+        engine.add_entity("parent", gs_mock.morphs.Box(), gs_mock.materials.Rigid())
+        engine.add_entity("child", gs_mock.morphs.Box(), gs_mock.materials.Rigid())
+        engine.build_scene()
+        parent = engine._entities["parent"].genesis_entity
+        child = engine._entities["child"].genesis_entity
+        parent.get_pos.return_value = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+        child.get_pos.return_value = np.array([1.5, 2.0, 3.0], dtype=np.float32)
+        return engine, parent, child
+
+    def test_attach_follows_parent_relative_transform(self, mock_genesis):
+        engine, parent, child = self._engine_with_pair(mock_genesis)
+        handle = engine.attach_bodies("parent", "child")
+        assert isinstance(handle, AttachmentHandle)
+
+        child.set_pos.reset_mock()
+        parent.get_pos.return_value = np.array([2.0, 3.0, 4.0], dtype=np.float32)
+        engine.step(1.0 / 240.0)
+
+        np.testing.assert_allclose(
+            child.set_pos.call_args.args[0],
+            [2.5, 3.0, 4.0],
+            atol=1e-6,
+        )
+
+    def test_detach_stops_follow_updates(self, mock_genesis):
+        engine, parent, child = self._engine_with_pair(mock_genesis)
+        handle = engine.attach_bodies("parent", "child")
+        engine.detach_bodies(handle)
+        child.set_pos.reset_mock()
+
+        parent.get_pos.return_value = np.array([2.0, 3.0, 4.0], dtype=np.float32)
+        engine.step(1.0 / 240.0)
+
+        child.set_pos.assert_not_called()
+
+    def test_attach_rejects_duplicate_child(self, mock_genesis):
+        engine, _, _ = self._engine_with_pair(mock_genesis)
+        engine.attach_bodies("parent", "child")
+        with pytest.raises(ValueError, match="already attached"):
+            engine.attach_bodies("parent", "child")
+
+    def test_detach_unknown_handle_raises(self, mock_genesis):
+        engine, _, _ = self._engine_with_pair(mock_genesis)
+        with pytest.raises(KeyError, match="not active"):
+            engine.detach_bodies(AttachmentHandle("attachment_9999"))
+
+    def test_snapshot_restores_attachment(self, mock_genesis):
+        engine, parent, child = self._engine_with_pair(mock_genesis)
+        handle = engine.attach_bodies("parent", "child")
+        snap = engine.save_snapshot()
+        engine.detach_bodies(handle)
+        assert engine._attachments == {}
+
+        engine.restore_snapshot(snap)
+
+        assert list(engine._attachments) == [handle.attachment_id]
+        child.set_pos.reset_mock()
+        parent.get_pos.return_value = np.array([3.0, 4.0, 5.0], dtype=np.float32)
+        engine.step(1.0 / 240.0)
+        np.testing.assert_allclose(
+            child.set_pos.call_args.args[0],
+            [3.5, 4.0, 5.0],
+            atol=1e-6,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Raycaster (3 tests)
 # ---------------------------------------------------------------------------
 
@@ -931,6 +1012,16 @@ class TestTeardown:
         engine, _ = _make_built_engine(mock_genesis)
         engine.teardown()
         assert engine._entities == {}
+
+    def test_teardown_clears_attachments(self, mock_genesis):
+        gs_mock, _ = mock_genesis
+        engine = _make_engine(mock_genesis)
+        engine.add_entity("parent", gs_mock.morphs.Box(), gs_mock.materials.Rigid())
+        engine.add_entity("child", gs_mock.morphs.Box(), gs_mock.materials.Rigid())
+        engine.build_scene()
+        engine.attach_bodies("parent", "child")
+        engine.teardown()
+        assert engine._attachments == {}
 
     def test_teardown_clears_terrain(self, mock_genesis):
         engine = _make_engine(mock_genesis)

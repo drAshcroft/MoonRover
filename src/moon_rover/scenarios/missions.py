@@ -1,23 +1,26 @@
 """Concrete mission scenarios for the ScenarioRunner harness.
 
-Provides higher-fidelity, GPU-free :class:`~moon_rover.scenarios.runner.Scenario`
+Provides higher-fidelity :class:`~moon_rover.scenarios.runner.Scenario`
 implementations that drive real subsystem state machines (e.g. the antenna
-deployment lifecycle) end to end. These are deterministic and run without
-Genesis so they can serve as integration-test substrates and RL/dashboard
-baselines, while a future real-physics scenario can subclass ``Scenario`` and
-reuse the same runner.
+deployment lifecycle) end to end. The analytic scenario stays deterministic
+and GPU-free for integration tests and RL/dashboard baselines. The Genesis
+scenario builds a physical scene and emits the same telemetry contract.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Optional
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 import numpy as np
 
+from moon_rover.antenna.array import ArrayDesign
 from moon_rover.antenna.system import AntennaConfig, AntennaState, DeployableAntennaUnit
+from moon_rover.core.physics.engine import AttachmentHandle, GenesisConfig
+from moon_rover.core.scene.specs import Scene
 from moon_rover.scenarios.runner import Scenario
 
 
@@ -294,3 +297,380 @@ class MissionPlacementScenario(Scenario):
 def mission_placement_factory(config: dict) -> Scenario:
     """Scenario factory for :class:`MissionPlacementScenario`."""
     return MissionPlacementScenario(config)
+
+
+class GenesisMissionPhase(Enum):
+    """Physical single-antenna mission phases."""
+
+    CARRIED_SETTLE = "carried_settle"
+    RELEASE_SETTLE = "release_settle"
+    DONE = "done"
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_IDENTITY_QUAT = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+
+class GenesisMissionScenario(Scenario):
+    """Compose and step a real Genesis scene for one physical antenna release.
+
+    This is the first physics-in-the-loop mission slice. It intentionally keeps
+    navigation and arm motion scripted until the manipulation loop is wired:
+    compose the configured scene, attach the first stored antenna to the first
+    rover, release it over the first surveyed array target, settle it through
+    rigid contact physics, and commission the resulting placement.
+
+    Inject ``engine_factory`` and ``composer_factory`` for focused tests.
+    Production callers normally use the config-file defaults.
+    """
+
+    rover_type = "genesis_mission_diff_drive"
+
+    def __init__(self, config: Optional[dict] = None) -> None:
+        cfg = dict(config or {})
+        configs_dir = _PROJECT_ROOT / "configs"
+        self.scene_config_path = Path(cfg.get("scene_config_path", configs_dir / "scene.yaml"))
+        self.rover_config_path = Path(cfg.get("rover_config_path", configs_dir / "rover.yaml"))
+        self.mission_config_path = Path(cfg.get("mission_config_path", configs_dir / "mission.yaml"))
+        self.physics_config_path = Path(cfg.get("physics_config_path", configs_dir / "physics.yaml"))
+        sensors_path = cfg.get("sensors_config_path", configs_dir / "sensors.yaml")
+        self.sensors_config_path = None if sensors_path is None else Path(sensors_path)
+
+        self._engine_factory: Callable[[], Any] = cfg.get("engine_factory") or self._default_engine
+        self._composer_factory: Optional[Callable[[], Any]] = cfg.get("composer_factory")
+        self._physics_config: Optional[GenesisConfig] = cfg.get("physics_config")
+        self._backend = cfg.get("backend")
+        self._target_override = cfg.get("target_position")
+        self._target_quat_override = cfg.get("target_orientation_quat")
+        self.carry_steps = self._positive_int(cfg.get("carry_steps", 2), "carry_steps")
+        self.release_settle_steps = self._positive_int(
+            cfg.get("release_settle_steps", 30), "release_settle_steps"
+        )
+        self.render_hz = float(cfg.get("render_hz", 30.0))
+        if self.render_hz <= 0.0:
+            raise ValueError("render_hz must be > 0")
+
+        self._rng: Optional[np.random.Generator] = None
+        self._engine: Any = None
+        self._scene: Optional[Scene] = None
+        self._physics: Optional[GenesisConfig] = None
+        self._visualize = False
+        self._phase = GenesisMissionPhase.DONE
+        self._phase_ticks = 0
+        self._energy_wh = 0.0
+        self._attachment: Optional[AttachmentHandle] = None
+        self._rover_entity_name = ""
+        self._antenna_entity_name = ""
+        self._antenna_id = ""
+        self._target = np.zeros(3, dtype=np.float64)
+        self._target_quat = _IDENTITY_QUAT.copy()
+        self._antenna_config: Optional[AntennaConfig] = None
+        self._antenna_unit: Optional[DeployableAntennaUnit] = None
+        self._placements: list[dict] = []
+        self._faults: list[dict] = []
+        self._events: list[dict] = []
+
+    def setup(self, seed: int, *, visualize: bool = False) -> None:
+        self._rng = np.random.default_rng(seed)
+        self._visualize = bool(visualize)
+        self._phase = GenesisMissionPhase.DONE
+        self._phase_ticks = 0
+        self._energy_wh = 0.0
+        self._attachment = None
+        self._placements = []
+        self._faults = []
+        self._events = [{"event_type": "mission_start", "sim_time": 0.0, "payload": {"seed": seed}}]
+
+        engine = self._engine_factory()
+        self._engine = engine
+        try:
+            physics = self._resolve_physics_config()
+            self._physics = physics
+            engine.configure(physics, show_viewer=self._visualize)
+            scene = self._make_composer().compose_scene(engine)
+            self._bind_first_rover_and_antenna(scene)
+            self._attachment = engine.attach_bodies(
+                self._rover_entity_name, self._antenna_entity_name
+            )
+            assert self._antenna_unit is not None
+            if not self._antenna_unit.transition(AntennaState.GRIPPED):
+                raise RuntimeError("physical antenna could not transition to GRIPPED")
+            if not self._antenna_unit.transition(AntennaState.CARRIED):
+                raise RuntimeError("physical antenna could not transition to CARRIED")
+            self._phase = GenesisMissionPhase.CARRIED_SETTLE
+            self._events.append(
+                {
+                    "event_type": "antenna_picked",
+                    "sim_time": 0.0,
+                    "payload": {
+                        "antenna_id": self._antenna_id,
+                        "entity_name": self._antenna_entity_name,
+                    },
+                }
+            )
+        except Exception:
+            self._teardown_engine()
+            raise
+
+    def step(self) -> dict:
+        if self._engine is None or self._rng is None or self._physics is None:
+            raise RuntimeError("setup() must be called before step()")
+        if self._phase == GenesisMissionPhase.DONE:
+            raise RuntimeError("step() called after Genesis mission completed")
+
+        if (
+            self._phase == GenesisMissionPhase.CARRIED_SETTLE
+            and self._phase_ticks >= self.carry_steps
+        ):
+            self._release_antenna()
+
+        self._engine.step(self._physics.timestep, render=self._should_render())
+        self._phase_ticks += 1
+        if (
+            self._phase == GenesisMissionPhase.RELEASE_SETTLE
+            and self._phase_ticks >= self.release_settle_steps
+        ):
+            self._commission_placement()
+
+        return self._telemetry_record()
+
+    def is_complete(self) -> bool:
+        return self._phase == GenesisMissionPhase.DONE
+
+    def teardown(self) -> None:
+        sim_time = self._sim_time()
+        self._events.append({"event_type": "mission_end", "sim_time": sim_time, "payload": {}})
+        self._teardown_engine()
+
+    @property
+    def antenna_units(self) -> list[DeployableAntennaUnit]:
+        return [] if self._antenna_unit is None else [self._antenna_unit]
+
+    def antenna_states(self) -> list[AntennaState]:
+        return [unit.get_state() for unit in self.antenna_units]
+
+    @property
+    def antenna_placements(self) -> list[dict]:
+        return self._placements
+
+    @property
+    def faults(self) -> list[dict]:
+        return self._faults
+
+    @property
+    def events(self) -> list[dict]:
+        return self._events
+
+    def succeeded(self) -> bool:
+        return (
+            self._antenna_unit is not None
+            and self._antenna_unit.get_state() == AntennaState.ACTIVE
+        )
+
+    def _resolve_physics_config(self) -> GenesisConfig:
+        physics = self._physics_config or GenesisConfig.from_yaml(str(self.physics_config_path))
+        if self._backend is None:
+            return physics
+        backend = str(self._backend).lower()
+        if backend not in {"cpu", "gpu"}:
+            raise ValueError("backend must be 'cpu' or 'gpu'")
+        return replace(physics, use_gpu=backend == "gpu")
+
+    def _make_composer(self) -> Any:
+        if self._composer_factory is not None:
+            return self._composer_factory()
+        from moon_rover.core.scene.composer import GenesisSceneComposer
+
+        composer = GenesisSceneComposer()
+        composer.load_scene_config(str(self.scene_config_path))
+        composer.load_rover_config(str(self.rover_config_path))
+        composer.load_mission_config(str(self.mission_config_path))
+        composer.load_physics_config(str(self.physics_config_path))
+        composer.load_sensors_config(
+            None if self.sensors_config_path is None else str(self.sensors_config_path)
+        )
+        return composer
+
+    def _bind_first_rover_and_antenna(self, scene: Scene) -> None:
+        if not scene.rovers:
+            raise RuntimeError("composed Genesis mission scene has no rover")
+        rover = scene.rovers[0]
+        try:
+            antenna = next(item for item in scene.antennas if item.rover_id == rover.rover_id)
+        except StopIteration as exc:
+            raise RuntimeError(
+                f"composed Genesis mission scene has no antenna for rover {rover.rover_id!r}"
+            ) from exc
+
+        self._scene = scene
+        self._rover_entity_name = rover.rover_id
+        self._antenna_entity_name = f"{rover.rover_id}_antenna"
+        self._antenna_config = antenna.antenna_config
+        self._antenna_unit = DeployableAntennaUnit(antenna.antenna_config, self._engine)
+        design = ArrayDesign.from_yaml(self.mission_config_path)
+        target = design.elements[0]
+        self._antenna_id = target.element_id
+        self._target = np.asarray(
+            self._target_override if self._target_override is not None else target.position_xyz,
+            dtype=np.float64,
+        ).reshape(3)
+        self._target_quat = np.asarray(
+            self._target_quat_override
+            if self._target_quat_override is not None
+            else target.orientation_quat_xyzw,
+            dtype=np.float32,
+        ).reshape(4)
+
+    def _release_antenna(self) -> None:
+        assert self._engine is not None
+        assert self._antenna_unit is not None
+        assert self._antenna_config is not None
+        assert self._attachment is not None
+        self._engine.detach_bodies(self._attachment)
+        self._attachment = None
+        terrain_z = self._terrain_height(self._target[0], self._target[1], self._target[2])
+        clearance = (self._antenna_config.base_plate_m[2] * 0.5) + 0.005
+        release_pos = np.array([self._target[0], self._target[1], terrain_z + clearance])
+        self._engine.set_body_pose(self._antenna_entity_name, release_pos, self._target_quat)
+        self._engine.set_body_velocity(
+            self._antenna_entity_name, np.zeros(3), np.zeros(3)
+        )
+        self._phase = GenesisMissionPhase.RELEASE_SETTLE
+        self._phase_ticks = 0
+        self._events.append(
+            {
+                "event_type": "antenna_released",
+                "sim_time": self._sim_time(),
+                "payload": {"antenna_id": self._antenna_id, "target": self._target.tolist()},
+            }
+        )
+
+    def _commission_placement(self) -> None:
+        assert self._engine is not None
+        assert self._antenna_unit is not None
+        assert self._antenna_config is not None
+        actual, quat = self._engine.get_body_pose(self._antenna_entity_name)
+        actual = np.asarray(actual, dtype=np.float64).reshape(3)
+        terrain_z = self._terrain_height(actual[0], actual[1], self._target[2])
+        horizontal_error = float(np.linalg.norm(actual[:2] - self._target[:2]))
+        tilt_deg = self._tilt_deg(np.asarray(quat, dtype=np.float64))
+        base_height = self._antenna_config.base_plate_m[2]
+        grounded = float(actual[2]) <= terrain_z + base_height + 0.05
+        connector_engaged = grounded and horizontal_error <= 0.5
+        self._antenna_unit.set_placement(
+            position_xy=actual[:2],
+            tilt_deg=tilt_deg,
+            base_contact_corners=4 if grounded else 0,
+            position_error_m=horizontal_error,
+            connector_engaged=connector_engaged,
+        )
+        placed = self._antenna_unit.transition(AntennaState.PLACED)
+        deployed = placed and self._antenna_unit.transition(AntennaState.DEPLOYED)
+        activated = deployed and self._antenna_unit.transition(AntennaState.ACTIVE)
+        success = self._antenna_unit.get_state() == AntennaState.ACTIVE
+        self._placements.append(
+            {
+                "antenna_id": self._antenna_id,
+                "target": self._target.tolist(),
+                "actual": actual.tolist(),
+                "success": success,
+                "sim_time": self._sim_time(),
+                "failure_mode": None if success else "deployment_failed",
+            }
+        )
+        if not success:
+            self._faults.append(
+                {"mode": "deployment_failed", "time": self._sim_time(), "antenna_id": self._antenna_id}
+            )
+        self._events.append(
+            {
+                "event_type": "antenna_activated" if activated else "antenna_deploy_failed",
+                "sim_time": self._sim_time(),
+                "payload": {
+                    "antenna_id": self._antenna_id,
+                    "entity_name": self._antenna_entity_name,
+                    "state": self._antenna_unit.get_state().value,
+                },
+            }
+        )
+        self._phase = GenesisMissionPhase.DONE
+
+    def _telemetry_record(self) -> dict:
+        assert self._engine is not None
+        assert self._rng is not None
+        rover_pos, _ = self._engine.get_body_pose(self._rover_entity_name)
+        rover_lin, rover_ang = self._engine.get_body_velocity(self._rover_entity_name)
+        gt = np.asarray(rover_pos, dtype=np.float64).reshape(3)
+        est = gt + self._rng.normal(scale=0.04, size=3)
+        power_w = 60.0 + (20.0 if self._phase == GenesisMissionPhase.CARRIED_SETTLE else 10.0)
+        dt = self._physics.timestep if self._physics is not None else 0.0
+        self._energy_wh += power_w * (dt / 3600.0)
+        coverage = 1.0 if self.succeeded() else 0.0
+        return {
+            "timestamp": self._sim_time(),
+            "rover_position": gt.tolist(),
+            "velocity": np.asarray(rover_lin, dtype=np.float64).reshape(3).tolist(),
+            "energy_wh": self._energy_wh,
+            "power_consumed_w": power_w,
+            "cable_tension_n": 20.0,
+            "cable_coverage_fraction": coverage,
+            "estimated_position": est.tolist(),
+            "ground_truth_position": gt.tolist(),
+            "imu": {
+                "accel_xyz": [0.0, 0.0, -1.622],
+                "gyro_xyz": np.asarray(rover_ang, dtype=np.float64).reshape(3).tolist(),
+                "timestamp": self._sim_time(),
+            },
+        }
+
+    def _should_render(self) -> bool:
+        assert self._engine is not None
+        assert self._physics is not None
+        if not self._visualize:
+            return False
+        cadence = max(1, round(1.0 / (self._physics.timestep * self.render_hz)))
+        return self._engine.get_step_count() % cadence == 0
+
+    def _sim_time(self) -> float:
+        return 0.0 if self._engine is None else float(self._engine.get_sim_time())
+
+    def _terrain_height(self, x: float, y: float, fallback: float) -> float:
+        assert self._engine is not None
+        try:
+            return float(self._engine.get_terrain_height(float(x), float(y)))
+        except (AttributeError, RuntimeError):
+            return float(fallback)
+
+    def _teardown_engine(self) -> None:
+        if self._engine is None:
+            return
+        engine, self._engine = self._engine, None
+        engine.teardown()
+
+    @staticmethod
+    def _positive_int(value: Any, name: str) -> int:
+        number = int(value)
+        if number <= 0:
+            raise ValueError(f"{name} must be > 0")
+        return number
+
+    @staticmethod
+    def _tilt_deg(quat_xyzw: np.ndarray) -> float:
+        quat = np.asarray(quat_xyzw, dtype=np.float64).reshape(4)
+        norm = float(np.linalg.norm(quat))
+        if norm <= 1e-12:
+            return 180.0
+        x, y, z, w = quat / norm
+        vertical_z = 1.0 - (2.0 * ((x * x) + (y * y)))
+        return math.degrees(math.acos(float(np.clip(vertical_z, -1.0, 1.0))))
+
+    @staticmethod
+    def _default_engine() -> Any:
+        from moon_rover.core.physics._genesis_engine import GenesisPhysicsEngine
+
+        return GenesisPhysicsEngine()
+
+
+def genesis_mission_factory(config: dict) -> Scenario:
+    """Scenario factory for :class:`GenesisMissionScenario`."""
+    return GenesisMissionScenario(config)

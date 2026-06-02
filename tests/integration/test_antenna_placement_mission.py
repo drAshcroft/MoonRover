@@ -8,8 +8,8 @@ mission KPIs land within tolerance.
 
 These exercise multiple subsystems together (ScenarioRunner + antenna lifecycle
 + MultiStreamLogger + MissionMetricsAnalyzer), so they are marked ``slow``.
-The ``genesis``-marked test guards the real-physics variant, which is skipped
-until a Genesis-backed MissionPlacementScenario is wired.
+The ``genesis``-marked test guards the real-physics variant through an isolated
+Genesis subprocess so process-global runtime state does not leak across tests.
 """
 
 from __future__ import annotations
@@ -145,15 +145,16 @@ def test_run_single_reports_mission_metrics():
 
 @pytest.mark.genesis
 @pytest.mark.slow
-def test_full_mission_real_genesis_physics():
-    """Real-physics variant: run the mission on a Genesis-backed scene.
-
-    Skipped until a Genesis-backed MissionPlacementScenario exists (it would
-    spawn the URDF rover + antenna entities and step real contact physics).
-    The deterministic mission above validates the orchestration/lifecycle; this
-    is the hook for the physics-in-the-loop variant.
-    """
-    pytest.skip(
-        "Genesis-backed MissionPlacementScenario not yet wired; "
-        "deterministic mission tests provide end-to-end coverage in the meantime."
+def test_full_mission_real_genesis_physics(tmp_path):
+    """Real-physics variant: release and activate an antenna under Genesis."""
+    from tests.physics_real._helpers import require_real_genesis_smoke
+    from tests.physics_real.test_real_genesis_mission_scenario import (
+        run_real_genesis_mission_smoke,
     )
+
+    require_real_genesis_smoke()
+    payload = run_real_genesis_mission_smoke(tmp_path)
+
+    assert payload["success"] is True
+    assert payload["antennas_deployed"] == 1
+    assert payload["antenna_state"] == AntennaState.ACTIVE.value

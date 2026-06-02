@@ -13,13 +13,19 @@ Classes:
 Typical Usage:
     sequencer = ManipulationSequencer(...)
     waypoints = sequencer.plan_pickup(depot_pose, target_pose)
-    success = sequencer.execute_task(ManipulationTask.ANTENNA_PICKUP, arm)
+    context = ManipulationTaskContext(
+        rover_world_pose=...,
+        depot_world_pose=...,
+        antenna_world_pose=...,
+    )
+    success = sequencer.execute_task(ManipulationTask.ANTENNA_PICKUP, arm, context)
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
 import numpy as np
-from typing import List
+from typing import List, Optional
 
 
 class ManipulationTask(Enum):
@@ -40,6 +46,24 @@ class ManipulationTask(Enum):
     TRANSPORT_STOW = "transport_stow"
     ANTENNA_PLACEMENT = "antenna_placement"
     CABLE_CONNECTION = "cable_connection"
+
+
+@dataclass(frozen=True)
+class ManipulationTaskContext:
+    """Live world-frame geometry needed to plan a manipulation task.
+
+    The arm planner emits rover-body-frame waypoints. Callers provide surveyed
+    targets and sensed entity poses in world coordinates alongside the rover
+    pose used to transform them into that planning frame.
+    """
+
+    rover_world_pose: np.ndarray
+    antenna_world_pose: Optional[np.ndarray] = None
+    depot_world_pose: Optional[np.ndarray] = None
+    surveyed_target_world_position: Optional[np.ndarray] = None
+    surveyed_surface_normal_world: Optional[np.ndarray] = None
+    antenna_port_world_pose: Optional[np.ndarray] = None
+    cable_reel_world_pose: Optional[np.ndarray] = None
 
 
 class ManipulationSequencer(ABC):
@@ -111,9 +135,9 @@ class ManipulationSequencer(ABC):
 
         Args:
             target_position (np.ndarray): Target deployment location [x, y, z]
-                                          (3-element position in world frame)
+                                          (3-element position in rover body frame)
             surface_normal (np.ndarray): Surface normal at target for orientation [nx, ny, nz]
-                                        (unit vector indicating antenna mounting direction)
+                                        (unit vector in rover body frame)
 
         Returns:
             List[np.ndarray]: Ordered list of arm end-effector waypoints.
@@ -124,7 +148,7 @@ class ManipulationSequencer(ABC):
             NotImplementedError: Implementation pending.
 
         Example:
-            target = np.array([50.0, 10.0, 0.0])  # 50m east, 10m north, ground level
+            target = np.array([0.6, 0.0, 0.0])  # 0.6m forward in rover body frame
             normal = np.array([0.0, 0.0, 1.0])    # Vertical mounting
             waypoints = sequencer.plan_placement(target, normal)
         """
@@ -141,9 +165,8 @@ class ManipulationSequencer(ABC):
         align the cable connector, and mate the connection.
 
         Args:
-            antenna_port_pose (np.ndarray): Antenna connector port pose
+            antenna_port_pose (np.ndarray): Antenna connector port pose in rover body frame
                                             [x, y, z, qx, qy, qz, qw]
-                                            (7-element pose in world frame)
 
         Returns:
             List[np.ndarray]: Ordered list of arm end-effector waypoints.
@@ -154,7 +177,7 @@ class ManipulationSequencer(ABC):
             NotImplementedError: Implementation pending.
 
         Example:
-            port_pose = np.array([50.0, 10.0, 0.5, 0, 0, 0.707, 0.707])
+            port_pose = np.array([0.5, 0.0, 0.15, 0, 0, 0.707, 0.707])
             waypoints = sequencer.plan_cable_connection(port_pose)
         """
         raise NotImplementedError("plan_cable_connection implementation pending")
@@ -163,7 +186,8 @@ class ManipulationSequencer(ABC):
     def execute_task(
         self,
         task: ManipulationTask,
-        arm: 'ManipulatorArm'
+        arm: 'ManipulatorArm',
+        context: Optional[ManipulationTaskContext] = None,
     ) -> bool:
         """Execute a high-level manipulation task.
 
@@ -177,6 +201,7 @@ class ManipulationSequencer(ABC):
                                    - arm.follow_trajectory(waypoints) -> bool
                                    - arm.get_status() -> str
                                    - arm.abort() -> bool
+            context: Live world-frame poses required by antenna and cable tasks.
 
         Returns:
             bool: True if task completed successfully, False on failure.
@@ -187,7 +212,12 @@ class ManipulationSequencer(ABC):
             NotImplementedError: Implementation pending.
 
         Example:
-            success = sequencer.execute_task(ManipulationTask.ANTENNA_PICKUP, arm)
+            context = ManipulationTaskContext(
+                rover_world_pose=rover_pose,
+                depot_world_pose=depot_pose,
+                antenna_world_pose=antenna_pose,
+            )
+            success = sequencer.execute_task(ManipulationTask.ANTENNA_PICKUP, arm, context)
             if success:
                 print("Antenna picked up successfully")
             else:
@@ -235,7 +265,11 @@ def _pose7(x: float, y: float, z: float, qx: float = 0.0, qy: float = 0.0,
 
 def _surface_normal_to_quat(normal: np.ndarray) -> np.ndarray:
     """Convert surface normal to quaternion orienting Z-axis toward normal."""
-    n = normal / (np.linalg.norm(normal) + 1e-9)
+    normal = _require_vector(normal, 3, "surface_normal")
+    norm = float(np.linalg.norm(normal))
+    if norm <= 1e-12:
+        raise ValueError("surface_normal must not be a zero vector")
+    n = normal / norm
     z = np.array([0.0, 0.0, 1.0])
     cross = np.cross(z, n)
     cross_norm = np.linalg.norm(cross)
@@ -248,6 +282,80 @@ def _surface_normal_to_quat(normal: np.ndarray) -> np.ndarray:
     angle = float(np.arccos(np.clip(np.dot(z, n), -1.0, 1.0)))
     s = np.sin(angle / 2.0)
     return np.array([axis[0] * s, axis[1] * s, axis[2] * s, np.cos(angle / 2.0)])
+
+
+def _require_vector(value: np.ndarray, length: int, name: str) -> np.ndarray:
+    """Return a finite float vector of the required length."""
+    vector = np.asarray(value, dtype=np.float64).reshape(-1)
+    if vector.shape != (length,):
+        raise ValueError(f"{name} must contain exactly {length} values")
+    if not np.all(np.isfinite(vector)):
+        raise ValueError(f"{name} must contain only finite values")
+    return vector
+
+
+def _normalize_quat(quat: np.ndarray, name: str) -> np.ndarray:
+    """Normalize an [x, y, z, w] quaternion."""
+    vector = _require_vector(quat, 4, name)
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-12:
+        raise ValueError(f"{name} must not be a zero quaternion")
+    return vector / norm
+
+
+def _quat_conjugate(quat: np.ndarray) -> np.ndarray:
+    """Return the conjugate of an [x, y, z, w] quaternion."""
+    x, y, z, w = quat
+    return np.array([-x, -y, -z, w], dtype=np.float64)
+
+
+def _quat_multiply(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """Multiply two normalized [x, y, z, w] quaternions."""
+    lx, ly, lz, lw = left
+    rx, ry, rz, rw = right
+    return _normalize_quat(
+        np.array(
+            [
+                lw * rx + lx * rw + ly * rz - lz * ry,
+                lw * ry - lx * rz + ly * rw + lz * rx,
+                lw * rz + lx * ry - ly * rx + lz * rw,
+                lw * rw - lx * rx - ly * ry - lz * rz,
+            ]
+        ),
+        "quaternion product",
+    )
+
+
+def _quat_rotate(quat: np.ndarray, vector: np.ndarray) -> np.ndarray:
+    """Rotate a 3-vector by an [x, y, z, w] quaternion."""
+    q_xyz = quat[:3]
+    return vector + (2.0 * np.cross(q_xyz, np.cross(q_xyz, vector) + quat[3] * vector))
+
+
+def _world_position_to_body(position_world: np.ndarray, rover_world_pose: np.ndarray) -> np.ndarray:
+    """Transform a world-frame position into rover body coordinates."""
+    rover_pose = _require_vector(rover_world_pose, 7, "rover_world_pose")
+    position = _require_vector(position_world, 3, "world position")
+    rover_inverse = _quat_conjugate(_normalize_quat(rover_pose[3:7], "rover_world_pose quaternion"))
+    return _quat_rotate(rover_inverse, position - rover_pose[:3])
+
+
+def _world_vector_to_body(vector_world: np.ndarray, rover_world_pose: np.ndarray) -> np.ndarray:
+    """Rotate a world-frame direction into rover body coordinates."""
+    rover_pose = _require_vector(rover_world_pose, 7, "rover_world_pose")
+    vector = _require_vector(vector_world, 3, "world vector")
+    rover_inverse = _quat_conjugate(_normalize_quat(rover_pose[3:7], "rover_world_pose quaternion"))
+    return _quat_rotate(rover_inverse, vector)
+
+
+def _world_pose_to_body(pose_world: np.ndarray, rover_world_pose: np.ndarray) -> np.ndarray:
+    """Transform a world-frame pose into rover body coordinates."""
+    pose = _require_vector(pose_world, 7, "world pose")
+    rover_pose = _require_vector(rover_world_pose, 7, "rover_world_pose")
+    body_position = _world_position_to_body(pose[:3], rover_pose)
+    rover_inverse = _quat_conjugate(_normalize_quat(rover_pose[3:7], "rover_world_pose quaternion"))
+    body_quat = _quat_multiply(rover_inverse, _normalize_quat(pose[3:7], "world pose quaternion"))
+    return _pose7(*body_position, *body_quat)
 
 
 class ArmManipulationSequencer(ManipulationSequencer):
@@ -344,12 +452,14 @@ class ArmManipulationSequencer(ManipulationSequencer):
         self,
         task: ManipulationTask,
         arm: "ManipulatorArm",
+        context: Optional[ManipulationTaskContext] = None,
     ) -> bool:
+        self._validate_context(task, context)
         self._current_task = task
         success = False
         for attempt in range(self._MAX_TASK_RETRIES + 1):
             try:
-                success = self._run_task(task, arm)
+                success = self._run_task(task, arm, context)
                 if success:
                     break
                 logger.warning("Task %s attempt %d/%d failed, retrying", task.value, attempt + 1, self._MAX_TASK_RETRIES + 1)
@@ -362,15 +472,22 @@ class ArmManipulationSequencer(ManipulationSequencer):
         self._current_task = None
         return success
 
-    def _run_task(self, task: ManipulationTask, arm: "ManipulatorArm") -> bool:
+    def _run_task(
+        self,
+        task: ManipulationTask,
+        arm: "ManipulatorArm",
+        context: Optional[ManipulationTaskContext],
+    ) -> bool:
         if task == ManipulationTask.TRANSPORT_STOW:
             stow = self.get_stow_with_payload_pose()
             return bool(arm.follow_trajectory([stow]))
 
         if task == ManipulationTask.ANTENNA_PICKUP:
-            # Build nominal pick from depot directly in front of rover
-            depot = _pose7(0.5, 0.0, -0.3)
-            antenna = _pose7(0.5, 0.0, -0.35)
+            assert context is not None
+            assert context.depot_world_pose is not None
+            assert context.antenna_world_pose is not None
+            depot = _world_pose_to_body(context.depot_world_pose, context.rover_world_pose)
+            antenna = _world_pose_to_body(context.antenna_world_pose, context.rover_world_pose)
             waypoints = self.plan_pickup(depot, antenna)
             if not arm.follow_trajectory(waypoints[:-2]):  # approach → grasp
                 return False
@@ -383,10 +500,15 @@ class ArmManipulationSequencer(ManipulationSequencer):
             return bool(arm.follow_trajectory(waypoints[-2:]))
 
         if task == ManipulationTask.ANTENNA_PLACEMENT:
-            # Placement location assumed to be set by caller via a target pose;
-            # use a nominal ground-level target directly forward of the rover.
-            target = np.array([0.6, 0.0, 0.0])
-            normal = np.array([0.0, 0.0, 1.0])
+            assert context is not None
+            assert context.surveyed_target_world_position is not None
+            assert context.surveyed_surface_normal_world is not None
+            target = _world_position_to_body(
+                context.surveyed_target_world_position, context.rover_world_pose
+            )
+            normal = _world_vector_to_body(
+                context.surveyed_surface_normal_world, context.rover_world_pose
+            )
             waypoints = self.plan_placement(target, normal)
             if not arm.follow_trajectory(waypoints[:3]):  # approach → contact
                 return False
@@ -398,13 +520,18 @@ class ArmManipulationSequencer(ManipulationSequencer):
             return bool(arm.follow_trajectory(waypoints[3:]))  # retract
 
         if task == ManipulationTask.CABLE_CONNECTION:
-            port = _pose7(0.5, 0.0, 0.15)
+            assert context is not None
+            assert context.antenna_port_world_pose is not None
+            port = _world_pose_to_body(context.antenna_port_world_pose, context.rover_world_pose)
             waypoints = self.plan_cable_connection(port)
             return bool(arm.follow_trajectory(waypoints))
 
         if task == ManipulationTask.CABLE_REEL_PICKUP:
-            depot = _pose7(0.4, 0.0, -0.25)
-            reel = _pose7(0.4, 0.0, -0.30)
+            assert context is not None
+            assert context.depot_world_pose is not None
+            assert context.cable_reel_world_pose is not None
+            depot = _world_pose_to_body(context.depot_world_pose, context.rover_world_pose)
+            reel = _world_pose_to_body(context.cable_reel_world_pose, context.rover_world_pose)
             waypoints = self.plan_pickup(depot, reel)
             if not arm.follow_trajectory(waypoints[:-2]):
                 return False
@@ -416,6 +543,46 @@ class ArmManipulationSequencer(ManipulationSequencer):
 
         logger.warning("Unknown task type: %s", task)
         return False
+
+    @staticmethod
+    def _validate_context(
+        task: ManipulationTask,
+        context: Optional[ManipulationTaskContext],
+    ) -> None:
+        """Reject tasks whose live planning geometry is incomplete."""
+        required_by_task = {
+            ManipulationTask.ANTENNA_PICKUP: ("depot_world_pose", "antenna_world_pose"),
+            ManipulationTask.ANTENNA_PLACEMENT: (
+                "surveyed_target_world_position",
+                "surveyed_surface_normal_world",
+            ),
+            ManipulationTask.CABLE_CONNECTION: ("antenna_port_world_pose",),
+            ManipulationTask.CABLE_REEL_PICKUP: ("depot_world_pose", "cable_reel_world_pose"),
+        }
+        required = required_by_task.get(task, ())
+        if not required:
+            return
+        if context is None:
+            raise ValueError(f"{task.value} requires a ManipulationTaskContext")
+        rover_pose = _require_vector(context.rover_world_pose, 7, "rover_world_pose")
+        _normalize_quat(rover_pose[3:7], "rover_world_pose quaternion")
+        missing = [name for name in required if getattr(context, name) is None]
+        if missing:
+            raise ValueError(f"{task.value} context missing: {', '.join(missing)}")
+        vector_lengths = {
+            "depot_world_pose": 7,
+            "antenna_world_pose": 7,
+            "surveyed_target_world_position": 3,
+            "surveyed_surface_normal_world": 3,
+            "antenna_port_world_pose": 7,
+            "cable_reel_world_pose": 7,
+        }
+        for name in required:
+            value = _require_vector(getattr(context, name), vector_lengths[name], name)
+            if vector_lengths[name] == 7:
+                _normalize_quat(value[3:7], f"{name} quaternion")
+            if name == "surveyed_surface_normal_world" and np.linalg.norm(value) <= 1e-12:
+                raise ValueError("surveyed_surface_normal_world must not be a zero vector")
 
     def get_stow_with_payload_pose(self) -> np.ndarray:
         """Return body-frame stow pose: tucked in, centred, slightly raised."""

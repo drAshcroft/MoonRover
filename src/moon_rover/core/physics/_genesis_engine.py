@@ -51,7 +51,12 @@ def _to_numpy(tensor_or_array, dtype=np.float32) -> np.ndarray:
     except AttributeError:
         return np.array(tensor_or_array, dtype=dtype)
 
-from moon_rover.core.physics.engine import GenesisConfig, PhysicsEngine, ScenePhase
+from moon_rover.core.physics.engine import (
+    AttachmentHandle,
+    GenesisConfig,
+    PhysicsEngine,
+    ScenePhase,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +100,17 @@ class _TerrainRecord:
     resolution_y: int             # H
 
 
+@dataclass
+class _AttachmentRecord:
+    """Deterministic kinematic-follow attachment between two rigid bodies."""
+
+    handle: AttachmentHandle
+    parent_name: str
+    child_name: str
+    relative_pos: NDArray
+    relative_quat: NDArray
+
+
 @dataclass(frozen=True)
 class _GenesisRuntimeConfig:
     """Tracks process-global Genesis settings that must stay compatible."""
@@ -133,6 +149,39 @@ def _call_first(obj: Any, names: Tuple[str, ...], *args: Any, **kwargs: Any) -> 
         if method is not None:
             return method(*args, **kwargs)
     raise AttributeError(f"{type(obj).__name__} has none of: {', '.join(names)}")
+
+
+def _quat_conjugate(quat: NDArray) -> NDArray:
+    """Return the conjugate of an [x, y, z, w] quaternion."""
+    q = np.asarray(quat, dtype=np.float32).reshape(4)
+    return np.array([-q[0], -q[1], -q[2], q[3]], dtype=np.float32)
+
+
+def _quat_multiply(left: NDArray, right: NDArray) -> NDArray:
+    """Multiply two [x, y, z, w] quaternions."""
+    lx, ly, lz, lw = np.asarray(left, dtype=np.float32).reshape(4)
+    rx, ry, rz, rw = np.asarray(right, dtype=np.float32).reshape(4)
+    out = np.array(
+        [
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+            lw * rw - lx * rx - ly * ry - lz * rz,
+        ],
+        dtype=np.float32,
+    )
+    norm = float(np.linalg.norm(out))
+    return out if norm <= 1e-12 else (out / norm).astype(np.float32)
+
+
+def _quat_rotate(quat: NDArray, vector: NDArray) -> NDArray:
+    """Rotate a 3-vector by an [x, y, z, w] quaternion."""
+    q = np.asarray(quat, dtype=np.float32).reshape(4)
+    v = np.asarray(vector, dtype=np.float32).reshape(3)
+    q_xyz = q[:3]
+    return (
+        v + (2.0 * np.cross(q_xyz, np.cross(q_xyz, v) + q[3] * v))
+    ).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +248,8 @@ class GenesisPhysicsEngine(PhysicsEngine):
 
         self._raycasters: Dict[str, _RaycasterRecord] = {}
         self._terrain: Optional[_TerrainRecord] = None
+        self._attachments: Dict[str, _AttachmentRecord] = {}
+        self._attachment_counter: int = 0
 
         self._sim_time: float = 0.0
         self._step_count: int = 0
@@ -821,6 +872,8 @@ class GenesisPhysicsEngine(PhysicsEngine):
                 "same value as GenesisConfig.timestep."
             )
 
+        self._apply_attachments()
+
         # Cache velocities only for bodies that opted into acceleration telemetry.
         with self._entity_lock:
             for record in self._entities.values():
@@ -854,6 +907,7 @@ class GenesisPhysicsEngine(PhysicsEngine):
             self._scene.step()
         self._sim_time += self._dt
         self._step_count += 1
+        self._apply_attachments()
 
     # ------------------------------------------------------------------
     # ABC: teardown
@@ -882,6 +936,7 @@ class GenesisPhysicsEngine(PhysicsEngine):
         # Release Python references
         with self._entity_lock:
             self._entities.clear()
+            self._attachments.clear()
         self._raycasters.clear()
         self._terrain = None
         self._scene = None
@@ -994,6 +1049,17 @@ class GenesisPhysicsEngine(PhysicsEngine):
             "dt":         self._dt,
             "n_envs":     self._n_envs,
             "entities":   entity_states,
+            "attachments": [
+                {
+                    "attachment_id": record.handle.attachment_id,
+                    "parent_name": record.parent_name,
+                    "child_name": record.child_name,
+                    "relative_pos": record.relative_pos.copy(),
+                    "relative_quat": record.relative_quat.copy(),
+                }
+                for record in self._attachments.values()
+            ],
+            "attachment_counter": self._attachment_counter,
         }
         return pickle.dumps(snapshot, protocol=5)
 
@@ -1178,6 +1244,91 @@ class GenesisPhysicsEngine(PhysicsEngine):
 
         self._sim_time = float(snapshot["sim_time"])
         self._step_count = int(snapshot["step_count"])
+        attachments: Dict[str, _AttachmentRecord] = {}
+        for state in snapshot.get("attachments", []):
+            handle = AttachmentHandle(str(state["attachment_id"]))
+            parent_name = str(state["parent_name"])
+            child_name = str(state["child_name"])
+            if parent_name not in self._entities or child_name not in self._entities:
+                raise ValueError(
+                    "Snapshot attachment references entities not present in this "
+                    f"scene: parent={parent_name!r}, child={child_name!r}"
+                )
+            attachments[handle.attachment_id] = _AttachmentRecord(
+                handle=handle,
+                parent_name=parent_name,
+                child_name=child_name,
+                relative_pos=np.asarray(state["relative_pos"], dtype=np.float32),
+                relative_quat=np.asarray(state["relative_quat"], dtype=np.float32),
+            )
+        self._attachments = attachments
+        self._attachment_counter = int(snapshot.get("attachment_counter", 0))
+        self._apply_attachments()
+
+    # ------------------------------------------------------------------
+    # ABC: runtime rigid attachments
+    # ------------------------------------------------------------------
+
+    @_require_phase(ScenePhase.SIMULATION)
+    def attach_bodies(self, parent: str, child: str) -> AttachmentHandle:
+        """Attach ``child`` to ``parent`` with deterministic kinematic follow.
+
+        Genesis 0.4.4 does not expose a stable runtime weld API through the
+        adapter. This fallback slaves the child's pose and velocity to the
+        parent's relative transform before and after each physics step.
+        """
+        if parent == child:
+            raise ValueError("Cannot attach an entity to itself.")
+        parent_rec = self._get_record(parent)
+        child_rec = self._get_record(child)
+        if parent_rec.entity_type not in ("rigid", "kinematic"):
+            raise ValueError(f"Attachment parent {parent!r} is not a rigid body.")
+        if child_rec.entity_type not in ("rigid", "kinematic"):
+            raise ValueError(f"Attachment child {child!r} is not a rigid body.")
+        if any(record.child_name == child for record in self._attachments.values()):
+            raise ValueError(f"Attachment child {child!r} is already attached.")
+
+        parent_pos, parent_quat = self.get_body_pose(parent)
+        child_pos, child_quat = self.get_body_pose(child)
+        parent_inv = _quat_conjugate(parent_quat)
+        relative_pos = _quat_rotate(parent_inv, child_pos - parent_pos)
+        relative_quat = _quat_multiply(parent_inv, child_quat)
+        self._attachment_counter += 1
+        handle = AttachmentHandle(f"attachment_{self._attachment_counter:04d}")
+        self._attachments[handle.attachment_id] = _AttachmentRecord(
+            handle=handle,
+            parent_name=parent,
+            child_name=child,
+            relative_pos=relative_pos,
+            relative_quat=relative_quat,
+        )
+        self._apply_attachment(self._attachments[handle.attachment_id])
+        return handle
+
+    @_require_phase(ScenePhase.SIMULATION)
+    def detach_bodies(self, handle: AttachmentHandle) -> None:
+        """Release a kinematic-follow attachment while preserving body state."""
+        attachment_id = handle.attachment_id
+        if attachment_id not in self._attachments:
+            raise KeyError(f"Attachment {attachment_id!r} is not active.")
+        self._apply_attachment(self._attachments[attachment_id])
+        del self._attachments[attachment_id]
+
+    def _apply_attachments(self) -> None:
+        """Update every attached child from its parent's current transform."""
+        for record in list(self._attachments.values()):
+            self._apply_attachment(record)
+
+    def _apply_attachment(self, record: _AttachmentRecord) -> None:
+        """Update one child pose and velocity without advancing physics."""
+        parent_pos, parent_quat = self.get_body_pose(record.parent_name)
+        parent_lin, parent_ang = self.get_body_velocity(record.parent_name)
+        rotated_offset = _quat_rotate(parent_quat, record.relative_pos)
+        child_pos = parent_pos + rotated_offset
+        child_quat = _quat_multiply(parent_quat, record.relative_quat)
+        child_lin = parent_lin + np.cross(parent_ang, rotated_offset)
+        self.set_body_pose(record.child_name, child_pos, child_quat)
+        self.set_body_velocity(record.child_name, child_lin, parent_ang)
 
     # ------------------------------------------------------------------
     # ABC: get_phase

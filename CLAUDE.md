@@ -50,6 +50,7 @@ The backlog for this project is managed in the waterfree todo mcp.  use this hea
 - Genesis 0.4.4 cannot serialize MPM particle state. `can_snapshot_mpm` remains `False`.
 - Genesis 0.4.4 does not expose raycaster normals directly; the adapter returns zero-filled normals when the backend does not provide them.
 - Contact queries support both real Genesis 0.4.4 entity contact dictionaries and the older mock scene-level object-list path used by unit tests.
+- Runtime rigid attachments use a deterministic kinematic-follow fallback: `attach_bodies(parent, child)` preserves the current relative transform and slaves the child pose/velocity before and after each step until `detach_bodies(handle)`. Attachment state is snapshot-safe. Genesis 0.4.4 does not expose a stable runtime weld API through the local adapter.
 
 ### Terrain and contact semantics
 

@@ -20,6 +20,40 @@
         "spacing_m": { "type": "number", "exclusiveMinimum": 0 }
       }
     },
+    "array": {
+      "type": "object",
+      "required": ["array_id", "operating_band", "commissioning"],
+      "properties": {
+        "array_id":                 { "type": "string", "minLength": 1 },
+        "reference_origin_xyz":     { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+        "placement_tolerance_m":    { "type": "number", "exclusiveMinimum": 0 },
+        "tilt_tolerance_deg":       { "type": "number", "exclusiveMinimum": 0 },
+        "baseline_tolerance_m":     { "type": "number", "exclusiveMinimum": 0 },
+        "operating_band": {
+          "type": "object",
+          "required": ["center_frequency_hz", "bandwidth_hz"],
+          "properties": {
+            "center_frequency_hz": { "type": "number", "exclusiveMinimum": 0 },
+            "bandwidth_hz":        { "type": "number", "exclusiveMinimum": 0 },
+            "polarization":        { "type": "string" }
+          }
+        },
+        "commissioning": {
+          "type": "object",
+          "required": ["topology"],
+          "properties": {
+            "topology":            { "enum": ["home_run_umbilical", "trunk_with_taps", "wireless_relay"] },
+            "timing_distribution": { "type": "string" },
+            "data_transport":      { "type": "string" },
+            "power_distribution":  { "type": "string" },
+            "require_connector_lock": { "type": "boolean" },
+            "require_timing_lock":    { "type": "boolean" },
+            "require_data_link":      { "type": "boolean" },
+            "require_power_good":     { "type": "boolean" }
+          }
+        }
+      }
+    },
     "rovers": {
       "type": "array",
       "minItems": 1,

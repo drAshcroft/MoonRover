@@ -53,6 +53,7 @@ from moon_rover.navigation.control.mpc import MPCController, MPCConfig  # noqa: 
 from moon_rover.navigation.manipulation.sequencer import (  # noqa: E402
     ArmManipulationSequencer,
     ManipulationTask,
+    ManipulationTaskContext,
 )
 
 # Sensor layer (same modules used by the demo)
@@ -309,9 +310,17 @@ def run(args: argparse.Namespace) -> bool:
     # Sequencer smoke test (before physics loop)
     # ------------------------------------------------------------------
     print("\n[seq]  Testing ManipulationSequencer...")
+    manipulation_context = ManipulationTaskContext(
+        rover_world_pose=np.array([gt.x, gt.y, 0.0, 0.0, 0.0, 0.0, 1.0]),
+        depot_world_pose=np.array([gt.x + 0.5, gt.y, -0.3, 0.0, 0.0, 0.0, 1.0]),
+        antenna_world_pose=np.array([gt.x + 0.5, gt.y, -0.35, 0.0, 0.0, 0.0, 1.0]),
+        surveyed_target_world_position=np.array([gt.x + 0.6, gt.y, 0.0]),
+        surveyed_surface_normal_world=np.array([0.0, 0.0, 1.0]),
+        antenna_port_world_pose=np.array([gt.x + 0.5, gt.y, 0.15, 0.0, 0.0, 0.0, 1.0]),
+    )
     for task in (ManipulationTask.ANTENNA_PICKUP, ManipulationTask.ANTENNA_PLACEMENT,
                  ManipulationTask.CABLE_CONNECTION, ManipulationTask.TRANSPORT_STOW):
-        ok = seq.execute_task(task, mock_arm)
+        ok = seq.execute_task(task, mock_arm, manipulation_context)
         n_trajs = len(mock_arm.trajectory_log)
         print(f"         {task.value:<22} -> {'OK' if ok else 'FAIL'}  "
               f"(total trajectory segments so far: {n_trajs})")
@@ -605,4 +614,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -1,6 +1,7 @@
 """Physics engine interfaces and Genesis-backed implementation."""
 
 from moon_rover.core.physics.engine import (
+    AttachmentHandle,
     GenesisConfig,
     GenesisPhysicsEngine,
     PhysicsEngine,
@@ -8,6 +9,7 @@ from moon_rover.core.physics.engine import (
 )
 
 __all__ = [
+    "AttachmentHandle",
     "GenesisConfig",
     "GenesisPhysicsEngine",
     "PhysicsEngine",
