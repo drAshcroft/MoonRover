@@ -21,7 +21,9 @@ from moon_rover.antenna.array import ArrayDesign
 from moon_rover.antenna.system import AntennaConfig, AntennaState, DeployableAntennaUnit
 from moon_rover.core.physics.engine import AttachmentHandle, GenesisConfig
 from moon_rover.core.scene.specs import Scene
+from moon_rover.data.analysis.metrics import ArrayQualityReport, MissionMetricsAnalyzer
 from moon_rover.scenarios.runner import Scenario
+from moon_rover.visualization.video_export import RecorderConfig, VideoRecorder
 
 
 def default_antenna_config() -> AntennaConfig:
@@ -310,6 +312,10 @@ class GenesisMissionPhase(Enum):
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _IDENTITY_QUAT = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
 
+# Sentinel for RecorderConfig.track_body meaning "follow this scenario's rover";
+# resolved to the bound rover entity name once the scene is composed.
+_ROVER_TRACK_SENTINEL = "@rover"
+
 
 class GenesisMissionScenario(Scenario):
     """Compose and step a real Genesis scene for one physical antenna release.
@@ -350,6 +356,23 @@ class GenesisMissionScenario(Scenario):
         if self.render_hz <= 0.0:
             raise ValueError("render_hz must be > 0")
 
+        # Mission success = array built to spec. A run succeeds only when every
+        # commissioned element it placed is within the surveyed ArrayDesign
+        # tolerance (position + tilt), every evaluable baseline holds, and the
+        # built fraction of the full design reaches this floor. This slice
+        # commissions a single element, so the completion floor defaults to 0.0
+        # (success := the placed element is to-spec); multi-element array
+        # missions should raise it toward 1.0 to demand the whole array.
+        self.success_min_completion_fraction = self._unit_fraction(
+            cfg.get("success_min_completion_fraction", 0.0),
+            "success_min_completion_fraction",
+        )
+
+        # Optional MP4 demo recording. Accepts a RecorderConfig, a dict of its
+        # fields, or a path-like (records a rover-tracking shot to that file).
+        self._recorder = self._build_recorder(cfg.get("record_video"))
+        self._video_path: Optional[Path] = None
+
         self._rng: Optional[np.random.Generator] = None
         self._engine: Any = None
         self._scene: Optional[Scene] = None
@@ -366,6 +389,8 @@ class GenesisMissionScenario(Scenario):
         self._target_quat = _IDENTITY_QUAT.copy()
         self._antenna_config: Optional[AntennaConfig] = None
         self._antenna_unit: Optional[DeployableAntennaUnit] = None
+        self._array_design: Optional[ArrayDesign] = None
+        self._analyzer = MissionMetricsAnalyzer()
         self._placements: list[dict] = []
         self._faults: list[dict] = []
         self._events: list[dict] = []
@@ -387,8 +412,18 @@ class GenesisMissionScenario(Scenario):
             physics = self._resolve_physics_config()
             self._physics = physics
             engine.configure(physics, show_viewer=self._visualize)
+            # Camera must be registered during CONSTRUCTION, before the composer
+            # builds the scene.
+            if self._recorder is not None:
+                self._recorder.attach(engine)
             scene = self._make_composer().compose_scene(engine)
             self._bind_first_rover_and_antenna(scene)
+            if self._recorder is not None:
+                # Resolve the "track the rover" sentinel to the bound entity now
+                # that the scene exists; an explicit name or None is left as-is.
+                if self._recorder.config.track_body == _ROVER_TRACK_SENTINEL:
+                    self._recorder.set_track_body(self._rover_entity_name)
+                self._recorder.start()
             self._attachment = engine.attach_bodies(
                 self._rover_entity_name, self._antenna_entity_name
             )
@@ -426,6 +461,8 @@ class GenesisMissionScenario(Scenario):
 
         self._engine.step(self._physics.timestep, render=self._should_render())
         self._phase_ticks += 1
+        if self._recorder is not None and self._should_capture():
+            self._recorder.capture()
         if (
             self._phase == GenesisMissionPhase.RELEASE_SETTLE
             and self._phase_ticks >= self.release_settle_steps
@@ -440,7 +477,21 @@ class GenesisMissionScenario(Scenario):
     def teardown(self) -> None:
         sim_time = self._sim_time()
         self._events.append({"event_type": "mission_end", "sim_time": sim_time, "payload": {}})
+        # Encode the video while the scene is still alive, but never let a
+        # recording failure leak the engine — always tear it down, then surface.
+        recording_error: Optional[BaseException] = None
+        try:
+            self._finalize_recording()
+        except BaseException as exc:  # noqa: BLE001 - re-raised after teardown
+            recording_error = exc
         self._teardown_engine()
+        if recording_error is not None:
+            raise recording_error
+
+    @property
+    def video_path(self) -> Optional[Path]:
+        """Path to the recorded MP4 once teardown has written it, else None."""
+        return self._video_path
 
     @property
     def antenna_units(self) -> list[DeployableAntennaUnit]:
@@ -461,10 +512,47 @@ class GenesisMissionScenario(Scenario):
     def events(self) -> list[dict]:
         return self._events
 
+    def array_quality_report(self, committed_only: bool = True) -> Optional[ArrayQualityReport]:
+        """Score the deployed array against the surveyed :class:`ArrayDesign`.
+
+        Args:
+            committed_only: When True (default) only elements that reached the
+                commissioned (``ACTIVE``) state count as built; geometrically
+                placed-but-uncommissioned elements are excluded. When False the
+                report reflects every placement record regardless of state.
+
+        Returns:
+            The :class:`ArrayQualityReport`, or ``None`` if the design has not
+            been bound yet (``setup()`` not called).
+        """
+        if self._array_design is None:
+            return None
+        placements = {
+            record["antenna_id"]: record["actual"]
+            for record in self._placements
+            if record.get("antenna_id") is not None
+            and record.get("actual") is not None
+            and (not committed_only or record.get("success") is True)
+        }
+        return self._analyzer.array_quality_report(
+            self._array_design, placements, run_id=self._antenna_id or None
+        )
+
     def succeeded(self) -> bool:
+        """Mission success := the array was built to the design spec.
+
+        True only when at least one element was commissioned, every commissioned
+        element sits within the surveyed design tolerance, all evaluable pairwise
+        baselines hold, and the built fraction of the full design meets
+        ``success_min_completion_fraction``.
+        """
+        report = self.array_quality_report(committed_only=True)
+        if report is None or report.elements_placed == 0:
+            return False
         return (
-            self._antenna_unit is not None
-            and self._antenna_unit.get_state() == AntennaState.ACTIVE
+            report.elements_within_tolerance == report.elements_placed
+            and report.baselines_within_tolerance == report.baselines_evaluated
+            and report.completion_fraction >= self.success_min_completion_fraction
         )
 
     def _resolve_physics_config(self) -> GenesisConfig:
@@ -508,6 +596,7 @@ class GenesisMissionScenario(Scenario):
         self._antenna_config = antenna.antenna_config
         self._antenna_unit = DeployableAntennaUnit(antenna.antenna_config, self._engine)
         design = ArrayDesign.from_yaml(self.mission_config_path)
+        self._array_design = design
         target = design.elements[0]
         self._antenna_id = target.element_id
         self._target = np.asarray(
@@ -631,6 +720,14 @@ class GenesisMissionScenario(Scenario):
         cadence = max(1, round(1.0 / (self._physics.timestep * self.render_hz)))
         return self._engine.get_step_count() % cadence == 0
 
+    def _should_capture(self) -> bool:
+        """Capture a video frame at the recorder's target fps cadence."""
+        assert self._engine is not None
+        assert self._physics is not None and self._recorder is not None
+        fps = self._recorder.config.fps
+        cadence = max(1, round(1.0 / (self._physics.timestep * fps)))
+        return self._engine.get_step_count() % cadence == 0
+
     def _sim_time(self) -> float:
         return 0.0 if self._engine is None else float(self._engine.get_sim_time())
 
@@ -640,6 +737,42 @@ class GenesisMissionScenario(Scenario):
             return float(self._engine.get_terrain_height(float(x), float(y)))
         except (AttributeError, RuntimeError):
             return float(fallback)
+
+    @staticmethod
+    def _build_recorder(spec: Any) -> Optional[VideoRecorder]:
+        """Build a :class:`VideoRecorder` from the ``record_video`` config.
+
+        Accepts:
+            * ``None`` / ``False`` — recording disabled.
+            * a path-like — convenience form: records a rover-tracking shot to
+              that file (``track_body`` defaults to the rover sentinel).
+            * a mapping of :class:`RecorderConfig` fields, a
+              :class:`RecorderConfig`, or a :class:`VideoRecorder` — honored
+              verbatim. Set ``track_body`` to :data:`_ROVER_TRACK_SENTINEL` to
+              follow the rover, an entity name to follow that body, or ``None``
+              for a fixed wide shot.
+        """
+        if spec is None or spec is False:
+            return None
+        if isinstance(spec, VideoRecorder):
+            return spec
+        if isinstance(spec, RecorderConfig):
+            return VideoRecorder(spec)
+        if isinstance(spec, dict):
+            return VideoRecorder(RecorderConfig(**spec))
+        if isinstance(spec, (str, Path)):
+            return VideoRecorder(
+                RecorderConfig(output_path=Path(spec), track_body=_ROVER_TRACK_SENTINEL)
+            )
+        raise TypeError(
+            "record_video must be a path, dict, RecorderConfig, or VideoRecorder; "
+            f"got {type(spec).__name__}"
+        )
+
+    def _finalize_recording(self) -> None:
+        if self._recorder is None:
+            return
+        self._video_path = self._recorder.close()
 
     def _teardown_engine(self) -> None:
         if self._engine is None:
@@ -652,6 +785,13 @@ class GenesisMissionScenario(Scenario):
         number = int(value)
         if number <= 0:
             raise ValueError(f"{name} must be > 0")
+        return number
+
+    @staticmethod
+    def _unit_fraction(value: Any, name: str) -> float:
+        number = float(value)
+        if not 0.0 <= number <= 1.0:
+            raise ValueError(f"{name} must be in [0.0, 1.0]")
         return number
 
     @staticmethod

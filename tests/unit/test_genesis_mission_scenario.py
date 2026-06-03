@@ -117,6 +117,36 @@ class _FakeContactEngine:
         self.phase = ScenePhase.TEARDOWN
         self.torn_down = True
 
+    # -- camera / video capture -------------------------------------------
+    def add_camera(self, name, resolution, pos, lookat, fov):
+        self.camera = {
+            "name": name,
+            "resolution": resolution,
+            "pos": pos,
+            "lookat": lookat,
+            "fov": fov,
+        }
+        self.camera_poses: list = []
+        self.camera_frames = 0
+        self.camera_started = False
+        self.camera_saved: dict | None = None
+        return object()
+
+    def set_camera_pose(self, name, pos=None, lookat=None):
+        self.camera_poses.append((pos, lookat))
+
+    def start_camera_recording(self, name):
+        self.camera_started = True
+
+    def render_camera(self, name):
+        self.camera_frames += 1
+
+    def stop_camera_recording(self, name, save_path, fps):
+        from pathlib import Path as _Path
+
+        self.camera_saved = {"save_path": save_path, "fps": fps}
+        _Path(save_path).write_bytes(b"FAKEMP4")
+
 
 class _FakeComposer:
     def __init__(self, engine: _FakeContactEngine) -> None:
@@ -138,6 +168,12 @@ class _FakeComposer:
         )
 
 
+# Surveyed position of the first array element (element_r00_c00) in
+# configs/mission.yaml: grid origin [50, 50, 0]. Placing the antenna here lets
+# the array-built-to-spec success metric pass.
+_DESIGN_TARGET = [50.0, 50.0, 0.0]
+
+
 def _scenario_config(engine: _FakeContactEngine) -> dict:
     composer = _FakeComposer(engine)
     return {
@@ -145,7 +181,7 @@ def _scenario_config(engine: _FakeContactEngine) -> dict:
         "composer_factory": lambda: composer,
         "physics_config": _physics_config(),
         "backend": "cpu",
-        "target_position": [3.0, 4.0, 0.0],
+        "target_position": list(_DESIGN_TARGET),
         "carry_steps": 1,
         "release_settle_steps": 2,
     }
@@ -193,6 +229,132 @@ def test_genesis_mission_runs_through_existing_runner_contract():
     assert result.metrics.antennas_failed == 0
     assert result.metrics.cable_coverage_percent == pytest.approx(100.0)
     assert result.log_data["rover_position"].shape == (3, 3)
+
+
+def test_genesis_mission_success_requires_placement_within_design_tolerance():
+    engine = _FakeContactEngine()
+    config = _scenario_config(engine)
+    # Aim 1 m off the surveyed element target — beyond the 0.25 m design
+    # placement tolerance, but still within the 0.5 m connector-engage band so
+    # the unit reaches ACTIVE. The array-to-spec gate must still fail the run.
+    config["target_position"] = [_DESIGN_TARGET[0] + 1.0, _DESIGN_TARGET[1], 0.0]
+    scenario = GenesisMissionScenario(config)
+    scenario.setup(seed=1)
+    while not scenario.is_complete():
+        scenario.step()
+    scenario.teardown()
+
+    assert scenario.antenna_states() == [AntennaState.ACTIVE]
+    report = scenario.array_quality_report()
+    assert report is not None
+    assert report.elements_placed == 1
+    assert report.elements_within_tolerance == 0
+    assert report.max_position_error_m == pytest.approx(1.0, abs=0.05)
+    assert scenario.succeeded() is False
+
+
+def test_genesis_mission_array_quality_report_scores_to_spec_build():
+    engine = _FakeContactEngine()
+    scenario = GenesisMissionScenario(_scenario_config(engine))
+    scenario.setup(seed=2)
+    while not scenario.is_complete():
+        scenario.step()
+    scenario.teardown()
+
+    report = scenario.array_quality_report()
+    assert report is not None
+    assert report.array_id == "lunar_interferometer_001"
+    assert report.elements_designed == 20  # 4x5 grid
+    assert report.elements_placed == 1
+    assert report.elements_within_tolerance == 1
+    assert report.completion_fraction == pytest.approx(1.0 / 20.0)
+    assert scenario.succeeded() is True
+
+
+def test_genesis_mission_completion_floor_can_demand_full_array():
+    engine = _FakeContactEngine()
+    config = _scenario_config(engine)
+    # Demand the whole array be built: a single-element slice can no longer pass.
+    config["success_min_completion_fraction"] = 1.0
+    scenario = GenesisMissionScenario(config)
+    scenario.setup(seed=4)
+    while not scenario.is_complete():
+        scenario.step()
+    scenario.teardown()
+
+    assert scenario.antenna_states() == [AntennaState.ACTIVE]
+    assert scenario.succeeded() is False
+
+
+def test_genesis_mission_array_report_none_before_setup():
+    scenario = GenesisMissionScenario(_scenario_config(_FakeContactEngine()))
+    assert scenario.array_quality_report() is None
+
+
+def test_genesis_mission_rejects_out_of_range_completion_floor():
+    with pytest.raises(ValueError, match="success_min_completion_fraction"):
+        GenesisMissionScenario({"success_min_completion_fraction": 1.5})
+
+
+def test_genesis_mission_records_tracking_video(tmp_path):
+    from moon_rover.visualization.video_export import RecorderConfig
+
+    out = tmp_path / "demos" / "mission.mp4"
+    engine = _FakeContactEngine()
+    config = _scenario_config(engine)
+    config["record_video"] = RecorderConfig(
+        output_path=out, track_body="@rover", fps=30
+    )
+    scenario = GenesisMissionScenario(config)
+    scenario.setup(seed=7)
+    while not scenario.is_complete():
+        scenario.step()
+    scenario.teardown()
+
+    # Camera was added during construction and recording ran end to end.
+    assert engine.camera["name"] == "demo_camera"
+    assert engine.camera_started is True
+    assert engine.camera_frames == engine.step_count  # cadence 1 at dt=0.1, 30 fps
+    assert engine.camera_frames > 0
+    # The "@rover" sentinel resolved to the bound rover entity.
+    assert engine.camera_poses, "tracking shot should reposition the camera"
+    # Video was written and surfaced on the scenario.
+    assert engine.camera_saved == {"save_path": str(out), "fps": 30}
+    assert scenario.video_path == out
+    assert out.exists()
+
+
+def test_genesis_mission_path_string_records_rover_tracking(tmp_path):
+    out = tmp_path / "quick.mp4"
+    engine = _FakeContactEngine()
+    config = _scenario_config(engine)
+    config["record_video"] = str(out)
+    scenario = GenesisMissionScenario(config)
+    scenario.setup(seed=7)
+    while not scenario.is_complete():
+        scenario.step()
+    scenario.teardown()
+
+    assert scenario.video_path == out
+    assert out.exists()
+    # Path-string form defaults to a rover-tracking shot (camera repositioned).
+    assert engine.camera_poses
+
+
+def test_genesis_mission_no_recording_by_default():
+    engine = _FakeContactEngine()
+    scenario = GenesisMissionScenario(_scenario_config(engine))
+    scenario.setup(seed=7)
+    while not scenario.is_complete():
+        scenario.step()
+    scenario.teardown()
+    assert scenario.video_path is None
+    assert not hasattr(engine, "camera")
+
+
+def test_genesis_mission_rejects_bad_record_video_type():
+    with pytest.raises(TypeError, match="record_video"):
+        GenesisMissionScenario({"record_video": 123})
 
 
 def test_genesis_mission_setup_failure_tears_down_engine():

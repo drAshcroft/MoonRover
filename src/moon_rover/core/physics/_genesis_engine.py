@@ -89,6 +89,14 @@ class _RaycasterRecord:
 
 
 @dataclass
+class _CameraRecord:
+    """Tracks a Genesis offscreen camera used for video capture."""
+    name: str
+    genesis_camera: Any           # gs.Camera instance
+    recording: bool = False
+
+
+@dataclass
 class _TerrainRecord:
     """Stores terrain data for fast Python-level height/normal queries."""
     genesis_entity: Any
@@ -247,6 +255,7 @@ class GenesisPhysicsEngine(PhysicsEngine):
         self._entity_lock: threading.RLock = threading.RLock()
 
         self._raycasters: Dict[str, _RaycasterRecord] = {}
+        self._cameras: Dict[str, _CameraRecord] = {}
         self._terrain: Optional[_TerrainRecord] = None
         self._attachments: Dict[str, _AttachmentRecord] = {}
         self._attachment_counter: int = 0
@@ -633,6 +642,124 @@ class GenesisPhysicsEngine(PhysicsEngine):
             self._entities[name] = record
         return genesis_entity
 
+    # ------------------------------------------------------------------
+    # Camera / video capture
+    # ------------------------------------------------------------------
+
+    @_require_phase(ScenePhase.CONSTRUCTION)
+    def add_camera(
+        self,
+        name: str,
+        resolution: Tuple[int, int] = (1280, 720),
+        pos: Tuple[float, float, float] = (6.0, -6.0, 4.0),
+        lookat: Tuple[float, float, float] = (0.0, 0.0, 0.5),
+        fov: float = 45.0,
+        gui: bool = False,
+    ) -> Any:
+        """Register an offscreen camera for rendering frames / recording video.
+
+        Cameras must be added during CONSTRUCTION (before build_scene()), like
+        entities. The returned Genesis camera renders the scene from the given
+        viewpoint; use :meth:`start_camera_recording`, :meth:`render_camera`,
+        and :meth:`stop_camera_recording` during SIMULATION to capture an MP4.
+
+        Parameters:
+            name: Unique camera name for subsequent calls.
+            resolution: (width, height) in pixels. Even values are recommended
+                so the MP4 encoder (ffmpeg/libx264) accepts the frames.
+            pos: World-space camera position.
+            lookat: World-space point the camera aims at.
+            fov: Vertical field of view in degrees (0 < fov < 180).
+            gui: Open a per-camera preview window. Default False (headless).
+
+        Returns:
+            The Genesis camera object.
+
+        Raises:
+            RuntimeError: If called outside CONSTRUCTION phase.
+            ValueError: If the name is already registered or args are invalid.
+        """
+        if name in self._cameras:
+            raise ValueError(
+                f"Camera '{name}' is already registered. Names must be unique."
+            )
+        width, height = (int(resolution[0]), int(resolution[1]))
+        if width <= 0 or height <= 0:
+            raise ValueError(f"camera resolution must be positive; got {resolution!r}")
+        if not 0.0 < float(fov) < 180.0:
+            raise ValueError(f"camera fov must be in (0, 180); got {fov!r}")
+
+        camera = self._scene.add_camera(
+            res=(width, height),
+            pos=tuple(float(c) for c in pos),
+            lookat=tuple(float(c) for c in lookat),
+            fov=float(fov),
+            GUI=bool(gui),
+        )
+        self._cameras[name] = _CameraRecord(name=name, genesis_camera=camera)
+        return camera
+
+    @_require_phase(ScenePhase.SIMULATION)
+    def set_camera_pose(
+        self,
+        name: str,
+        pos: Optional[Tuple[float, float, float]] = None,
+        lookat: Optional[Tuple[float, float, float]] = None,
+    ) -> None:
+        """Reposition a camera mid-simulation (e.g. to track a moving body)."""
+        camera = self._require_camera(name).genesis_camera
+        kwargs: Dict[str, Any] = {}
+        if pos is not None:
+            kwargs["pos"] = tuple(float(c) for c in pos)
+        if lookat is not None:
+            kwargs["lookat"] = tuple(float(c) for c in lookat)
+        if kwargs:
+            _call_first(camera, ("set_pose",), **kwargs)
+
+    @_require_phase(ScenePhase.SIMULATION)
+    def start_camera_recording(self, name: str) -> None:
+        """Begin accumulating rendered frames for ``name`` into a video buffer."""
+        record = self._require_camera(name)
+        record.genesis_camera.start_recording()
+        record.recording = True
+
+    @_require_phase(ScenePhase.SIMULATION)
+    def render_camera(self, name: str) -> Any:
+        """Render one frame from ``name``; appends to the video when recording."""
+        return self._require_camera(name).genesis_camera.render()
+
+    @_require_phase(ScenePhase.SIMULATION)
+    def stop_camera_recording(
+        self, name: str, save_path: str, fps: int = 30
+    ) -> None:
+        """Finalize the recording for ``name`` and encode it to ``save_path``.
+
+        Parameters:
+            name: Camera whose recording to flush.
+            save_path: Output file path (``.mp4`` recommended).
+            fps: Playback frame rate for the encoded video.
+
+        Raises:
+            RuntimeError: If the camera is not currently recording.
+        """
+        record = self._require_camera(name)
+        if not record.recording:
+            raise RuntimeError(f"Camera '{name}' is not recording.")
+        if int(fps) <= 0:
+            raise ValueError(f"fps must be > 0; got {fps!r}")
+        record.genesis_camera.stop_recording(
+            save_to_filename=str(save_path), fps=int(fps)
+        )
+        record.recording = False
+
+    def _require_camera(self, name: str) -> _CameraRecord:
+        record = self._cameras.get(name)
+        if record is None:
+            raise ValueError(
+                f"Camera '{name}' is not registered. Add it with add_camera()."
+            )
+        return record
+
     @_require_phase(ScenePhase.CONSTRUCTION)
     def add_terrain_entity(
         self,
@@ -938,6 +1065,7 @@ class GenesisPhysicsEngine(PhysicsEngine):
             self._entities.clear()
             self._attachments.clear()
         self._raycasters.clear()
+        self._cameras.clear()
         self._terrain = None
         self._scene = None
 

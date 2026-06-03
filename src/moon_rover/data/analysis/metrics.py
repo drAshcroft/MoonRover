@@ -29,10 +29,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+
+from moon_rover.antenna.array import ArrayDesign, ArrayElementTarget, BaselineResidual
 
 
 @dataclass
@@ -139,6 +141,110 @@ class RunMetrics:
         return self.energy_consumed_wh / self.antennas_deployed
 
 
+@dataclass(frozen=True)
+class ArrayElementResidual:
+    """Per-element geometric accuracy of a deployed array element vs its target.
+
+    Attributes:
+        element_id: Design element identifier this record scores.
+        placed: True if a deployed position was supplied for the element.
+        position_error_m: Euclidean distance (m) between the deployed position
+            and the surveyed target, or ``None`` if the element was not placed.
+        tilt_error_deg: Angular deviation (deg) between the deployed mast
+            up-axis and the target up-axis, or ``None`` if no orientation was
+            supplied for the element.
+        within_position_tolerance: True if ``position_error_m`` is within the
+            element's ``placement_tolerance_m``. False when not placed.
+        within_tilt_tolerance: True if ``tilt_error_deg`` is within the
+            element's ``tilt_tolerance_deg``. True when no orientation was
+            supplied (tilt is not evaluated and does not penalize the element).
+        within_tolerance: True iff the element is placed and satisfies both the
+            position and tilt tolerances — i.e. it counts toward array quality.
+    """
+
+    element_id: str
+    placed: bool
+    position_error_m: Optional[float]
+    tilt_error_deg: Optional[float]
+    within_position_tolerance: bool
+    within_tilt_tolerance: bool
+    within_tolerance: bool
+
+
+@dataclass(frozen=True)
+class ArrayQualityReport:
+    """Completion and quality assessment of a deployed interferometric array.
+
+    Scores the deployed product against an :class:`ArrayDesign`: how many of
+    the designed elements were placed, how accurately each sits relative to its
+    surveyed target, and whether the pairwise baselines that define the
+    instrument are within tolerance.
+
+    Attributes:
+        array_id: Identifier of the scored :class:`ArrayDesign`.
+        elements_designed: Number of elements the design calls for.
+        elements_placed: Number of designed elements with a deployed position.
+        elements_within_tolerance: Placed elements meeting both position and
+            tilt tolerances.
+        completion_fraction: ``elements_placed / elements_designed`` in [0, 1].
+        quality_fraction: ``elements_within_tolerance / elements_designed`` in
+            [0, 1] — the fraction of the design that is built *to spec*.
+        mean_position_error_m / max_position_error_m / rms_position_error_m:
+            Position-error statistics over placed elements (0.0 if none placed).
+        baselines_designed: Number of pairwise baselines in the design.
+        baselines_evaluated: Baselines whose both endpoints were placed.
+        baselines_within_tolerance: Evaluated baselines within their tolerance.
+        mean_baseline_error_m / max_baseline_error_m: Baseline-error statistics
+            over evaluated baselines (0.0 if none evaluated).
+        array_complete: True iff every designed element is placed within
+            tolerance and every designed baseline was evaluated and is within
+            tolerance — i.e. the array is built to spec.
+        element_residuals: Per-element accuracy records (design order).
+        baseline_residuals: Per-baseline residuals for evaluated baselines.
+        run_id: Optional run identifier carried for joins/logging.
+    """
+
+    array_id: str
+    elements_designed: int
+    elements_placed: int
+    elements_within_tolerance: int
+    completion_fraction: float
+    quality_fraction: float
+    mean_position_error_m: float
+    max_position_error_m: float
+    rms_position_error_m: float
+    baselines_designed: int
+    baselines_evaluated: int
+    baselines_within_tolerance: int
+    mean_baseline_error_m: float
+    max_baseline_error_m: float
+    array_complete: bool
+    element_residuals: tuple[ArrayElementResidual, ...] = field(default_factory=tuple)
+    baseline_residuals: tuple[BaselineResidual, ...] = field(default_factory=tuple)
+    run_id: Optional[str] = None
+
+    def to_summary(self) -> Dict[str, Any]:
+        """Flatten the headline KPIs into a dict for the dashboard / logs."""
+        return {
+            "array_id": self.array_id,
+            "run_id": self.run_id,
+            "elements_designed": self.elements_designed,
+            "elements_placed": self.elements_placed,
+            "elements_within_tolerance": self.elements_within_tolerance,
+            "completion_fraction": self.completion_fraction,
+            "quality_fraction": self.quality_fraction,
+            "mean_position_error_m": self.mean_position_error_m,
+            "max_position_error_m": self.max_position_error_m,
+            "rms_position_error_m": self.rms_position_error_m,
+            "baselines_designed": self.baselines_designed,
+            "baselines_evaluated": self.baselines_evaluated,
+            "baselines_within_tolerance": self.baselines_within_tolerance,
+            "mean_baseline_error_m": self.mean_baseline_error_m,
+            "max_baseline_error_m": self.max_baseline_error_m,
+            "array_complete": self.array_complete,
+        }
+
+
 class AnalysisToolkit(ABC):
     """Abstract interface for Moon Rover mission performance analysis.
 
@@ -177,6 +283,16 @@ class AnalysisToolkit(ABC):
     @abstractmethod
     def cable_health_report(self, tension_series: np.ndarray) -> Dict:
         """Analyze cable tension history and estimate cable health."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def array_quality_report(
+        self,
+        design: ArrayDesign,
+        placements: Any,
+        run_id: Optional[str] = None,
+    ) -> ArrayQualityReport:
+        """Score a deployed antenna array against its design specification."""
         raise NotImplementedError
 
 
@@ -519,6 +635,100 @@ class MissionMetricsAnalyzer(AnalysisToolkit):
             "health_status": health,
         }
 
+    # ------------------------------------------------------------------
+    # Interferometric array completion & quality
+    # ------------------------------------------------------------------
+
+    def array_quality_report(
+        self,
+        design: ArrayDesign,
+        placements: Any,
+        run_id: Optional[str] = None,
+    ) -> ArrayQualityReport:
+        """Score a deployed antenna array against its :class:`ArrayDesign`.
+
+        Args:
+            design: The surveyed array build specification.
+            placements: Deployed element poses, in any of these forms:
+
+                * a mapping ``{element_id: position_xyz}`` where the value is a
+                  length-3 sequence;
+                * a mapping ``{element_id: record}`` where ``record`` is a dict
+                  with a position under ``position_xyz`` / ``position`` /
+                  ``actual`` and, optionally, ``orientation_quat_xyzw`` (xyzw)
+                  or an explicit ``tilt_deg``;
+                * an iterable of such records, each additionally carrying an
+                  ``element_id`` (or ``antenna_id``) key.
+
+                Unknown element IDs (not in the design) are ignored. Designed
+                elements with no record are reported as not placed.
+            run_id: Optional identifier carried into the report.
+
+        Returns:
+            An :class:`ArrayQualityReport` with completion fraction, per-element
+            geometric accuracy, baseline residuals, and a build-to-spec flag.
+        """
+        records = _normalize_array_placements(placements)
+
+        element_residuals: List[ArrayElementResidual] = []
+        placed_positions: Dict[str, np.ndarray] = {}
+        position_errors: List[float] = []
+        placed_count = 0
+        within_tol_count = 0
+
+        for element in design.elements:
+            record = records.get(element.element_id)
+            residual = _score_element(element, record)
+            element_residuals.append(residual)
+            if residual.placed:
+                placed_count += 1
+                placed_positions[element.element_id] = record["position"]
+                if residual.position_error_m is not None:
+                    position_errors.append(residual.position_error_m)
+            if residual.within_tolerance:
+                within_tol_count += 1
+
+        n_designed = len(design.elements)
+        completion = placed_count / n_designed if n_designed else 0.0
+        quality = within_tol_count / n_designed if n_designed else 0.0
+
+        mean_pos_err, max_pos_err, rms_pos_err = _error_stats(position_errors)
+
+        baseline_residuals = _evaluate_available_baselines(design, placed_positions)
+        baseline_errors = [b.error_m for b in baseline_residuals]
+        n_baselines = len(design.baselines)
+        baselines_within = sum(1 for b in baseline_residuals if b.within_tolerance)
+        mean_bl_err, max_bl_err, _ = _error_stats(baseline_errors)
+
+        array_complete = (
+            n_designed > 0
+            and placed_count == n_designed
+            and within_tol_count == n_designed
+            and len(baseline_residuals) == n_baselines
+            and baselines_within == n_baselines
+        )
+
+        return ArrayQualityReport(
+            array_id=design.array_id,
+            elements_designed=n_designed,
+            elements_placed=placed_count,
+            elements_within_tolerance=within_tol_count,
+            completion_fraction=float(completion),
+            quality_fraction=float(quality),
+            mean_position_error_m=mean_pos_err,
+            max_position_error_m=max_pos_err,
+            rms_position_error_m=rms_pos_err,
+            baselines_designed=n_baselines,
+            baselines_evaluated=len(baseline_residuals),
+            baselines_within_tolerance=baselines_within,
+            mean_baseline_error_m=mean_bl_err,
+            max_baseline_error_m=max_bl_err,
+            array_complete=array_complete,
+            element_residuals=tuple(element_residuals),
+            baseline_residuals=baseline_residuals,
+            run_id=run_id,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -655,3 +865,200 @@ def _empty_stats() -> Dict[str, float]:
         "p75": 0.0,
         "n": 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# Array completion / quality helpers
+# ---------------------------------------------------------------------------
+
+_POSITION_KEYS: tuple[str, ...] = ("position_xyz", "position", "actual", "actual_xyz")
+_ELEMENT_ID_KEYS: tuple[str, ...] = ("element_id", "antenna_id", "id")
+
+
+def _normalize_array_placements(placements: Any) -> Dict[str, Dict[str, Any]]:
+    """Normalize the flexible ``placements`` input to ``{id: {position, quat, tilt_deg}}``.
+
+    Accepts a mapping of id -> position/record or an iterable of records.
+    Records missing a usable position are dropped (treated as not placed).
+    """
+    if placements is None:
+        return {}
+
+    items: Iterable[tuple[Optional[str], Any]]
+    if isinstance(placements, Mapping):
+        items = placements.items()
+    else:
+        items = ((None, record) for record in placements)
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, value in items:
+        record = _parse_placement_record(key, value)
+        if record is not None:
+            out[record["element_id"]] = record
+    return out
+
+
+def _parse_placement_record(
+    key: Optional[str], value: Any
+) -> Optional[Dict[str, Any]]:
+    position: Optional[np.ndarray] = None
+    quat: Optional[np.ndarray] = None
+    tilt_deg: Optional[float] = None
+    element_id: Optional[str] = str(key) if key is not None else None
+
+    if isinstance(value, Mapping):
+        for id_key in _ELEMENT_ID_KEYS:
+            if value.get(id_key) is not None:
+                element_id = str(value[id_key])
+                break
+        for pos_key in _POSITION_KEYS:
+            if value.get(pos_key) is not None:
+                position = _as_xyz(value[pos_key])
+                break
+        if value.get("orientation_quat_xyzw") is not None:
+            quat = _as_quat(value["orientation_quat_xyzw"])
+        if value.get("tilt_deg") is not None:
+            tilt_deg = float(value["tilt_deg"])
+    else:
+        # Bare position sequence keyed by element id.
+        position = _as_xyz(value)
+
+    if element_id is None or position is None:
+        return None
+    return {
+        "element_id": element_id,
+        "position": position,
+        "quat": quat,
+        "tilt_deg": tilt_deg,
+    }
+
+
+def _as_xyz(value: Any) -> Optional[np.ndarray]:
+    try:
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if arr.size != 3:
+        return None
+    return arr
+
+
+def _as_quat(value: Any) -> Optional[np.ndarray]:
+    try:
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if arr.size != 4:
+        return None
+    return arr
+
+
+def _score_element(
+    element: ArrayElementTarget, record: Optional[Dict[str, Any]]
+) -> ArrayElementResidual:
+    if record is None:
+        return ArrayElementResidual(
+            element_id=element.element_id,
+            placed=False,
+            position_error_m=None,
+            tilt_error_deg=None,
+            within_position_tolerance=False,
+            within_tilt_tolerance=True,
+            within_tolerance=False,
+        )
+
+    target = np.asarray(element.position_xyz, dtype=np.float64)
+    pos_err = float(np.linalg.norm(record["position"] - target))
+    within_pos = pos_err <= element.placement_tolerance_m
+
+    tilt_err = _element_tilt_error_deg(element, record)
+    within_tilt = True if tilt_err is None else tilt_err <= element.tilt_tolerance_deg
+
+    return ArrayElementResidual(
+        element_id=element.element_id,
+        placed=True,
+        position_error_m=pos_err,
+        tilt_error_deg=tilt_err,
+        within_position_tolerance=within_pos,
+        within_tilt_tolerance=within_tilt,
+        within_tolerance=within_pos and within_tilt,
+    )
+
+
+def _element_tilt_error_deg(
+    element: ArrayElementTarget, record: Dict[str, Any]
+) -> Optional[float]:
+    """Angle (deg) between the deployed and target mast up-axes.
+
+    Prefers an explicit ``tilt_deg`` (interpreted as deviation from the target
+    orientation). Otherwise derives it from the deployed quaternion relative to
+    the design's target orientation. Returns ``None`` when neither is supplied.
+    """
+    if record.get("tilt_deg") is not None:
+        return abs(float(record["tilt_deg"]))
+    quat = record.get("quat")
+    if quat is None:
+        return None
+    actual_up = _quat_up_axis(quat)
+    target_up = _quat_up_axis(np.asarray(element.orientation_quat_xyzw, dtype=np.float64))
+    cos_angle = float(
+        np.clip(
+            np.dot(actual_up, target_up)
+            / (np.linalg.norm(actual_up) * np.linalg.norm(target_up) + 1e-18),
+            -1.0,
+            1.0,
+        )
+    )
+    return float(np.degrees(np.arccos(cos_angle)))
+
+
+def _quat_up_axis(quat: np.ndarray) -> np.ndarray:
+    """Body +Z axis expressed in world frame for a unit quaternion (x, y, z, w)."""
+    x, y, z, w = (float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]))
+    return np.array(
+        [2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y)],
+        dtype=np.float64,
+    )
+
+
+def _evaluate_available_baselines(
+    design: ArrayDesign, placed_positions: Dict[str, np.ndarray]
+) -> tuple[BaselineResidual, ...]:
+    """Evaluate only baselines whose both endpoints have deployed positions."""
+    evaluable = [
+        baseline
+        for baseline in design.baselines
+        if baseline.element_a in placed_positions
+        and baseline.element_b in placed_positions
+    ]
+    if not evaluable:
+        return ()
+    residuals: List[BaselineResidual] = []
+    for baseline in evaluable:
+        pos_a = placed_positions[baseline.element_a]
+        pos_b = placed_positions[baseline.element_b]
+        actual = float(np.linalg.norm(pos_b - pos_a))
+        error = abs(actual - baseline.target_length_m)
+        residuals.append(
+            BaselineResidual(
+                element_a=baseline.element_a,
+                element_b=baseline.element_b,
+                target_length_m=baseline.target_length_m,
+                actual_length_m=actual,
+                error_m=error,
+                within_tolerance=error <= baseline.tolerance_m,
+            )
+        )
+    return tuple(residuals)
+
+
+def _error_stats(errors: Sequence[float]) -> tuple[float, float, float]:
+    """Return (mean, max, rms) of an error list; (0, 0, 0) when empty."""
+    if not errors:
+        return 0.0, 0.0, 0.0
+    arr = np.asarray(errors, dtype=np.float64)
+    return (
+        float(arr.mean()),
+        float(arr.max()),
+        float(np.sqrt(np.mean(arr**2))),
+    )

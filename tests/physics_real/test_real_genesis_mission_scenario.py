@@ -87,7 +87,9 @@ episode = runner.run_episode(
         "engine_factory": GenesisPhysicsEngine,
         "composer_factory": SmokeComposer,
         "physics_config": physics,
-        "target_position": [2.0, 0.0, 0.0],
+        # Surveyed position of element_r00_c00 in configs/mission.yaml so the
+        # array-built-to-spec success gate passes (terrain is an infinite plane).
+        "target_position": [50.0, 50.0, 0.0],
         "carry_steps": 1,
         "release_settle_steps": 20,
     }},

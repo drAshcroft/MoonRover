@@ -137,6 +137,10 @@ from moon_rover.navigation.planning.path_planner import (  # noqa: E402
     PlannedPath,
     PlannerConfig,
 )
+from moon_rover.visualization.video_export import (  # noqa: E402
+    RecorderConfig,
+    VideoRecorder,
+)
 
 ROVER_NAME = "demo_rover"
 
@@ -204,6 +208,14 @@ def parse_args() -> argparse.Namespace:
                              "cable tension + terrain slope feed the MPC speed "
                              "limit so the rover visibly struggles when the "
                              "cable pulls taut. Implies --capability-demo.")
+    parser.add_argument("--record", type=Path, default=None,
+                        help="Record an MP4 of the run to this path. Renders an "
+                             "offscreen rover-tracking camera over the lunar "
+                             "world. Implies headless autonomous drive (--self-test) "
+                             "unless --navigation/--capability-demo is set, and "
+                             "uses the rich world scene even without a viewer.")
+    parser.add_argument("--record-fps", type=int, default=30,
+                        help="Frame rate for --record video. Default 30.")
     return parser.parse_args()
 
 
@@ -2167,6 +2179,17 @@ class NavigationDriver:
 def main() -> int:
     args = parse_args()
 
+    # Recording presets: produce a self-contained autonomous clip over the rich
+    # lunar world. Recording is headless (offscreen camera) and drives itself.
+    if args.record is not None:
+        args.no_viewer = True
+        args.no_keyboard = True
+        if not args.navigation and not args.capability_demo:
+            args.self_test = True
+        if not args.steps:
+            # The --self-test command sequence runs ~22 s of sim; give a tail.
+            args.steps = int(round(24.0 * args.sim_hz))
+
     rover_cfg_path = Path(args.rover_config)
     rover_yaml = load_rover_yaml(rover_cfg_path)
     profile = rover_yaml["profiles"][args.profile]
@@ -2188,8 +2211,9 @@ def main() -> int:
 
     # The rich lunar scene is the default in the viewer; headless runs and
     # --flat-ground keep the legacy bare plane so existing CI / balance-tuning
-    # behaviour (and determinism) is unchanged.
-    use_world = (not args.no_viewer) and (not args.flat_ground)
+    # behaviour (and determinism) is unchanged. Recording forces the rich world
+    # even though it is headless — that scene is the whole point of the clip.
+    use_world = (not args.flat_ground) and ((not args.no_viewer) or args.record is not None)
     world: Optional[LunarWorld] = None
     if use_world:
         world = LunarWorld(profile, args.sun_elevation_deg)
@@ -2216,6 +2240,7 @@ def main() -> int:
 
     engine = GenesisPhysicsEngine()
     keyboard: Optional[KeyboardPoll] = None
+    recorder: Optional[VideoRecorder] = None
     completed_cleanly = False
     try:
         configure_label = (
@@ -2225,6 +2250,20 @@ def main() -> int:
         )
         with ProgressSpinner(configure_label):
             engine.configure(cfg, show_viewer=not args.no_viewer, viewer_options=viewer_options)
+
+        # Offscreen recording camera must be registered before build_scene().
+        if args.record is not None:
+            recorder = VideoRecorder(
+                RecorderConfig(
+                    output_path=args.record,
+                    fps=args.record_fps,
+                    track_body=ROVER_NAME,
+                    # Chase cam: behind-and-above, framed on the rover body.
+                    camera_offset=(-2.8, -2.8, 1.9),
+                    lookat_offset=(0.0, 0.0, 0.35),
+                )
+            )
+            recorder.attach(engine)
 
         ground_friction = 1.2
         if world is not None:
@@ -2250,6 +2289,9 @@ def main() -> int:
 
         with ProgressSpinner("Building scene"):
             engine.build_scene()
+
+        if recorder is not None:
+            recorder.start()
 
         drive_config = drive_config_from_profile(profile, DriveType.TWO_WHEEL_DIFF)
         drive = create_drive_system(drive_config)
@@ -2385,7 +2427,7 @@ def main() -> int:
             engine, drive, wheel_actuator, power, arm, arm_bridge, balance,
             keyboard, cfg, args, spawn_z, capability_demo,
             world=world, spawn_xy=spawn_xy, viewer_controls=viewer_controls,
-            navigation=navigation,
+            navigation=navigation, recorder=recorder,
         )
         completed_cleanly = True
 
@@ -2395,6 +2437,18 @@ def main() -> int:
     finally:
         if keyboard is not None:
             keyboard.stop()
+        # Encode the video while the scene is still alive (before any teardown).
+        if recorder is not None:
+            try:
+                video_path = recorder.close()
+                if video_path is not None and video_path.exists():
+                    size_kb = video_path.stat().st_size / 1024.0
+                    print(f"  Recorded    : {video_path} "
+                          f"({recorder.frame_count} frames, {size_kb:.0f} KiB)")
+                else:
+                    print("  Recorded    : no video written (no frames captured).")
+            except Exception as exc:
+                print(f"  Recording failed during encode: {exc}")
         if args.destroy:
             try:
                 engine.teardown()
@@ -2427,9 +2481,13 @@ def run_loop(
     spawn_xy: tuple[float, float] = (0.0, 0.0),
     viewer_controls: Optional[ViewerControls] = None,
     navigation: Optional[NavigationDriver] = None,
+    recorder: Optional[VideoRecorder] = None,
 ) -> None:
     dt = cfg.timestep
     step_count = 0
+    record_cadence = (
+        max(1, round(1.0 / (dt * args.record_fps))) if recorder is not None else 0
+    )
     wall_start = time.perf_counter()
     next_report_wall = wall_start
     pace_to_real_time = not args.no_viewer
@@ -2621,6 +2679,10 @@ def run_loop(
             )
 
         step_count += 1
+
+        # Capture a video frame at the recorder's target fps cadence.
+        if recorder is not None and step_count % record_cadence == 0:
+            recorder.capture()
 
         # Real-time pacing: sleep to the next physics deadline, but never burst.
         if pace_to_real_time:

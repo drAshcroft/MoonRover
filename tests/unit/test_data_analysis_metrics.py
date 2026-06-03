@@ -18,7 +18,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from moon_rover.antenna import ArrayDesign
 from moon_rover.data.analysis.metrics import (
+    ArrayQualityReport,
     MetricsConfig,
     MissionMetricsAnalyzer,
     RunMetrics,
@@ -337,3 +339,183 @@ def test_cable_health_empty_raises():
     analyzer = MissionMetricsAnalyzer()
     with pytest.raises(ValueError, match="non-empty"):
         analyzer.cable_health_report(np.array([]))
+
+
+# ---------------------------------------------------------------------------
+# Array completion / quality
+# ---------------------------------------------------------------------------
+
+
+def _array_design(spacing: float = 5.0) -> ArrayDesign:
+    """2x2 surveyed grid, 0.1 m placement / 3 deg tilt / 0.2 m baseline tol."""
+    return ArrayDesign.from_mission_config(
+        {
+            "grid": {
+                "origin": [0.0, 0.0, 0.0],
+                "num_rows": 2,
+                "num_cols": 2,
+                "spacing_m": spacing,
+                "orientation_degrees": 0.0,
+            },
+            "array": {
+                "array_id": "qa_array",
+                "placement_tolerance_m": 0.1,
+                "tilt_tolerance_deg": 3.0,
+                "baseline_tolerance_m": 0.2,
+            },
+        }
+    )
+
+
+def _exact_placements(design: ArrayDesign) -> dict:
+    return {e.element_id: np.asarray(e.position_xyz) for e in design.elements}
+
+
+def test_array_quality_perfect_build_is_complete():
+    analyzer = MissionMetricsAnalyzer()
+    design = _array_design()
+    report = analyzer.array_quality_report(design, _exact_placements(design), run_id="r1")
+
+    assert isinstance(report, ArrayQualityReport)
+    assert report.array_id == "qa_array"
+    assert report.run_id == "r1"
+    assert report.elements_designed == 4
+    assert report.elements_placed == 4
+    assert report.elements_within_tolerance == 4
+    assert report.completion_fraction == pytest.approx(1.0)
+    assert report.quality_fraction == pytest.approx(1.0)
+    assert report.mean_position_error_m == pytest.approx(0.0)
+    assert report.baselines_designed == 6
+    assert report.baselines_evaluated == 6
+    assert report.baselines_within_tolerance == 6
+    assert report.array_complete is True
+
+
+def test_array_quality_partial_completion_fraction():
+    analyzer = MissionMetricsAnalyzer()
+    design = _array_design()
+    placed = _exact_placements(design)
+    # Only deploy 2 of the 4 elements.
+    keep = [e.element_id for e in design.elements[:2]]
+    placements = {eid: placed[eid] for eid in keep}
+
+    report = analyzer.array_quality_report(design, placements)
+    assert report.elements_placed == 2
+    assert report.completion_fraction == pytest.approx(0.5)
+    assert report.quality_fraction == pytest.approx(0.5)
+    # Only the baseline between the two placed elements can be evaluated.
+    assert report.baselines_evaluated == 1
+    assert report.array_complete is False
+    # Unplaced elements are reported but flagged not placed.
+    not_placed = [r for r in report.element_residuals if not r.placed]
+    assert len(not_placed) == 2
+    assert all(r.position_error_m is None for r in not_placed)
+
+
+def test_array_quality_out_of_tolerance_position_lowers_quality():
+    analyzer = MissionMetricsAnalyzer()
+    design = _array_design()
+    placements = _exact_placements(design)
+    # Push one element 0.5 m off target (tolerance is 0.1 m).
+    bad_id = design.elements[0].element_id
+    placements[bad_id] = placements[bad_id] + np.array([0.5, 0.0, 0.0])
+
+    report = analyzer.array_quality_report(design, placements)
+    assert report.elements_placed == 4
+    assert report.elements_within_tolerance == 3
+    assert report.completion_fraction == pytest.approx(1.0)
+    assert report.quality_fraction == pytest.approx(0.75)
+    assert report.max_position_error_m == pytest.approx(0.5)
+    assert report.array_complete is False
+
+
+def test_array_quality_accepts_record_dicts_with_tilt():
+    analyzer = MissionMetricsAnalyzer()
+    design = _array_design()
+    records = []
+    for i, e in enumerate(design.elements):
+        records.append(
+            {
+                "element_id": e.element_id,
+                "position_xyz": list(e.position_xyz),
+                "tilt_deg": 1.0 if i == 0 else 10.0,  # element 0 ok, rest over 3 deg
+            }
+        )
+    report = analyzer.array_quality_report(design, records)
+    assert report.elements_placed == 4
+    # Only the first element is within the 3 deg tilt tolerance.
+    assert report.elements_within_tolerance == 1
+    first = report.element_residuals[0]
+    assert first.tilt_error_deg == pytest.approx(1.0)
+    assert first.within_tilt_tolerance is True
+
+
+def test_array_quality_tilt_from_quaternion():
+    analyzer = MissionMetricsAnalyzer()
+    design = _array_design()
+    # 10 deg tilt about X: quat = (sin(5deg), 0, 0, cos(5deg)) -> up-axis 10 deg off.
+    half = np.radians(10.0) / 2.0
+    tilted_quat = [np.sin(half), 0.0, 0.0, np.cos(half)]
+    records = {
+        e.element_id: {
+            "position_xyz": list(e.position_xyz),
+            "orientation_quat_xyzw": tilted_quat,
+        }
+        for e in design.elements
+    }
+    report = analyzer.array_quality_report(design, records)
+    assert all(
+        r.tilt_error_deg == pytest.approx(10.0, abs=1e-6)
+        for r in report.element_residuals
+    )
+    # 10 deg exceeds the 3 deg tolerance: none within tolerance.
+    assert report.elements_within_tolerance == 0
+
+
+def test_array_quality_baseline_out_of_tolerance():
+    analyzer = MissionMetricsAnalyzer()
+    design = _array_design()
+    placements = _exact_placements(design)
+    # Push one element 0.3 m off: exceeds both the 0.1 m placement tolerance and
+    # (for baselines aligned with the shift) the 0.2 m baseline tolerance.
+    bad_id = design.elements[0].element_id
+    placements[bad_id] = placements[bad_id] + np.array([0.3, 0.0, 0.0])
+
+    report = analyzer.array_quality_report(design, placements)
+    assert report.elements_within_tolerance == 3  # the shifted element fails
+    assert report.baselines_evaluated == 6
+    # At least one baseline touching the moved element now breaks tolerance.
+    assert report.baselines_within_tolerance < 6
+    assert report.array_complete is False
+
+
+def test_array_quality_empty_placements():
+    analyzer = MissionMetricsAnalyzer()
+    design = _array_design()
+    report = analyzer.array_quality_report(design, {})
+    assert report.elements_placed == 0
+    assert report.completion_fraction == 0.0
+    assert report.quality_fraction == 0.0
+    assert report.baselines_evaluated == 0
+    assert report.array_complete is False
+    assert report.mean_position_error_m == 0.0
+
+
+def test_array_quality_ignores_unknown_element_ids():
+    analyzer = MissionMetricsAnalyzer()
+    design = _array_design()
+    placements = _exact_placements(design)
+    placements["not_in_design"] = np.array([99.0, 99.0, 0.0])
+    report = analyzer.array_quality_report(design, placements)
+    assert report.elements_placed == 4
+    assert report.array_complete is True
+
+
+def test_array_quality_to_summary_keys():
+    analyzer = MissionMetricsAnalyzer()
+    design = _array_design()
+    report = analyzer.array_quality_report(design, _exact_placements(design))
+    summary = report.to_summary()
+    assert summary["completion_fraction"] == pytest.approx(1.0)
+    assert summary["array_complete"] is True
+    assert summary["elements_designed"] == 4

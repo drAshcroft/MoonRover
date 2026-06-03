@@ -209,6 +209,10 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# Generated demo / rendered video artifacts
+demos/
+*.mp4
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
