@@ -429,6 +429,7 @@ class GenesisPhysicsEngine(PhysicsEngine):
         config: GenesisConfig,
         show_viewer: bool = False,
         viewer_options: Optional[Any] = None,
+        vis_options: Optional[Any] = None,
     ) -> None:
         """Configure the physics engine and create the Genesis scene shell.
 
@@ -517,7 +518,7 @@ class GenesisPhysicsEngine(PhysicsEngine):
                 gravity=gravity,
                 grid_density=64,
             ),
-            vis_options=gs.options.VisOptions(),
+            vis_options=vis_options if vis_options is not None else gs.options.VisOptions(),
             show_viewer=show_viewer,
         )
         if viewer_options is not None:
@@ -766,6 +767,8 @@ class GenesisPhysicsEngine(PhysicsEngine):
         name: str,
         height_field: NDArray,
         size: List[float],
+        collision: bool = True,
+        visualization: bool = True,
     ) -> Any:
         """Register a terrain heightfield entity.
 
@@ -776,14 +779,25 @@ class GenesisPhysicsEngine(PhysicsEngine):
             name: Unique entity name.
             height_field: (H, W) float32 numpy array of terrain heights in metres.
             size: [size_x, size_y] world dimensions in metres.
+            collision: Whether the terrain participates in collision. Genesis
+                represents rigid terrain collision with an auto-resolution SDF
+                whose surface sits slightly above the rendered mesh, so bodies
+                can appear to hover. Set False to use the heightfield purely as
+                scenery and provide collision via a separate flat/proxy surface.
+            visualization: Whether the terrain mesh is rendered. ``collision``
+                and ``visualization`` cannot both be False.
 
         Returns:
             The Genesis terrain entity object.
 
         Raises:
             RuntimeError: If called outside CONSTRUCTION phase.
-            ValueError: If name already registered.
+            ValueError: If name already registered or both flags are False.
         """
+        if not collision and not visualization:
+            raise ValueError(
+                "add_terrain_entity: collision and visualization cannot both be False"
+            )
         height_field = np.asarray(height_field, dtype=np.float32)
         res_y, res_x = height_field.shape
         size_x, size_y = float(size[0]), float(size[1])
@@ -800,6 +814,8 @@ class GenesisPhysicsEngine(PhysicsEngine):
             vertical_scale=vertical_scale,
             n_subterrains=(1, 1),
             subterrain_size=(float(res_x), float(res_y)),
+            collision=collision,
+            visualization=visualization,
         )
         material = gs.materials.Rigid(
             rho=self._terrain_density_kg_m3,

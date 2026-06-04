@@ -23,9 +23,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+import numpy.typing as npt
 import yaml
+
+NDArray = npt.NDArray[np.float32]
 
 
 class ScenePhase(Enum):
@@ -133,11 +137,21 @@ class PhysicsEngine(ABC):
     """
 
     @abstractmethod
-    def configure(self, config: GenesisConfig) -> None:
+    def configure(
+        self,
+        config: GenesisConfig,
+        show_viewer: bool = False,
+        viewer_options: Optional[Any] = None,
+        vis_options: Optional[Any] = None,
+    ) -> None:
         """Configure the physics engine with simulation parameters.
 
         Parameters:
             config: GenesisConfig object with all simulation parameters.
+            show_viewer: Open an interactive 3-D viewer window if supported.
+            viewer_options: Backend-specific viewer options, or None for defaults.
+            vis_options: Backend-specific visualization options (e.g. shadows,
+                ambient light), or None for defaults.
 
         Raises:
             RuntimeError: If called when scene is not in CONSTRUCTION phase.
@@ -145,11 +159,15 @@ class PhysicsEngine(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def build_scene(self) -> None:
+    def build_scene(self, n_envs: int = 1) -> None:
         """Build the scene and transition from CONSTRUCTION to SIMULATION phase.
 
         This method finalizes scene construction and prepares the engine for stepping.
         After this call, no additional entities can be added.
+
+        Parameters:
+            n_envs: Number of parallel environments. Implementations may support
+                only ``n_envs=1``.
 
         Raises:
             RuntimeError: If called outside CONSTRUCTION phase or if scene is incomplete.
@@ -157,12 +175,14 @@ class PhysicsEngine(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def step(self, dt: float) -> None:
+    def step(self, dt: float, render: bool = True) -> None:
         """Advance simulation by dt seconds.
 
         Parameters:
             dt: Timestep in seconds. Should match config.timestep exactly for
                 deterministic replay and fixed-step accounting.
+            render: Whether to update the viewer/visualizer this step. Set False
+                for headless throughput or intermediate substeps.
 
         Raises:
             RuntimeError: If called outside SIMULATION phase.
@@ -260,6 +280,287 @@ class PhysicsEngine(ABC):
             }
         """
         raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Entity registration (CONSTRUCTION phase)
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def add_entity(
+        self,
+        name: str,
+        morph: Any,
+        material: Any,
+        entity_type: str = "rigid",
+        **kwargs: Any,
+    ) -> Any:
+        """Register a simulation entity during scene construction.
+
+        Parameters:
+            name: Unique entity name used for all subsequent queries.
+            morph: Backend morph/geometry descriptor (or a portable URDF string).
+            material: Backend material, or None to auto-select by ``entity_type``.
+            entity_type: One of "rigid", "articulated", "fixed", "kinematic",
+                "mpm", "terrain".
+            **kwargs: Additional backend-specific entity options.
+
+        Returns:
+            The backend entity handle.
+
+        Raises:
+            RuntimeError: If called outside CONSTRUCTION phase.
+            ValueError: If ``name`` is already registered.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def add_terrain_entity(
+        self,
+        name: str,
+        height_field: NDArray,
+        size: List[float],
+        collision: bool = True,
+        visualization: bool = True,
+    ) -> Any:
+        """Register a terrain heightfield entity during construction.
+
+        Parameters:
+            name: Unique entity name.
+            height_field: (H, W) array of terrain heights in metres.
+            size: [size_x, size_y] world dimensions in metres.
+            collision: Whether the terrain participates in collision.
+            visualization: Whether the terrain mesh is rendered.
+
+        Returns:
+            The backend terrain entity handle.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_entity(self, name: str) -> Any:
+        """Return the backend entity handle registered under ``name``."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_entities(self) -> List[str]:
+        """Return the names of all registered entities."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Body state queries
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def get_body_pose(
+        self, entity_name: str, env_idx: int = 0
+    ) -> Tuple[NDArray, NDArray]:
+        """Return the world-frame ``(position, quaternion)`` of a rigid entity."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_body_velocity(
+        self, entity_name: str, env_idx: int = 0
+    ) -> Tuple[NDArray, NDArray]:
+        """Return the world-frame ``(linear, angular)`` velocity of an entity."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_body_acceleration(
+        self, entity_name: str, env_idx: int = 0
+    ) -> Tuple[NDArray, NDArray]:
+        """Return the body's ``(linear, angular)`` acceleration from velocity deltas.
+
+        Acceleration may be tracked lazily; the first query after subscribing a
+        body can return zeros until a subsequent step provides a delta.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_link_poses(
+        self, entity_name: str, env_idx: int = 0
+    ) -> List[Tuple[NDArray, NDArray]]:
+        """Return the world-frame pose of every link in an articulated entity."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_link_velocities(
+        self, entity_name: str, env_idx: int = 0
+    ) -> List[Tuple[NDArray, NDArray]]:
+        """Return the world-frame velocity of every link in an articulated entity."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_dof_positions(self, entity_name: str, env_idx: int = 0) -> NDArray:
+        """Return the joint DOF positions of an articulated entity."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_dof_velocities(self, entity_name: str, env_idx: int = 0) -> NDArray:
+        """Return the joint DOF velocities of an articulated entity."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Body state setters / actuation (SIMULATION phase)
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def set_body_pose(
+        self, entity_name: str, pos: NDArray, quat: NDArray, env_idx: int = 0
+    ) -> None:
+        """Set the world-frame pose of a rigid entity."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def set_body_velocity(
+        self, entity_name: str, lin_vel: NDArray, ang_vel: NDArray, env_idx: int = 0
+    ) -> None:
+        """Set the world-frame velocity of a rigid entity."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def set_dof_positions(
+        self, entity_name: str, positions: NDArray, env_idx: int = 0
+    ) -> None:
+        """Set the joint DOF positions of an articulated entity."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def set_dof_velocities(
+        self, entity_name: str, velocities: NDArray, env_idx: int = 0
+    ) -> None:
+        """Set the joint DOF velocities of an articulated entity."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def apply_dof_forces(
+        self, entity_name: str, forces: NDArray, env_idx: int = 0
+    ) -> None:
+        """Apply forces/torques to the joint DOFs of an articulated entity."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Terrain queries
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def get_terrain_height(self, x: float, y: float) -> float:
+        """Return the terrain surface height (metres) at world ``(x, y)``."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_terrain_normal(self, x: float, y: float) -> NDArray:
+        """Return the unit terrain surface normal at world ``(x, y)``."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Contact queries
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def get_body_contacts(self, entity_name: str) -> List[Dict[str, Any]]:
+        """Return the active contacts involving ``entity_name``.
+
+        Each contact is a dict with at least ``other``, ``position``,
+        ``normal``, and ``force`` keys.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def is_in_contact(self, entity_a: str, entity_b: str) -> bool:
+        """Return whether two named entities are currently in contact."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Simulation clock
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def get_sim_time(self) -> float:
+        """Return the elapsed simulation time in seconds."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_step_count(self) -> int:
+        """Return the number of simulation steps taken since build."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Optional capabilities
+    #
+    # Declared on the contract so callers can target the abstraction, but given
+    # default implementations that raise NotImplementedError: a backend without
+    # a rasterizer (video capture) or ray sensor support is still a valid
+    # PhysicsEngine. Backends that support them override these.
+    # ------------------------------------------------------------------
+
+    def register_raycaster(
+        self,
+        name: str,
+        link_entity: str,
+        link_idx: int,
+        pattern_config: Dict[str, Any],
+        max_range: float,
+    ) -> None:
+        """Register a ray-cast sensor (e.g. LiDAR) during construction.
+
+        Optional capability. Raises NotImplementedError if unsupported.
+        """
+        raise NotImplementedError("this backend does not support ray-cast sensors")
+
+    def query_raycaster(self, name: str) -> Dict[str, NDArray]:
+        """Return the latest hits for a registered ray-cast sensor.
+
+        Optional capability. Raises NotImplementedError if unsupported.
+        """
+        raise NotImplementedError("this backend does not support ray-cast sensors")
+
+    def add_camera(
+        self,
+        name: str,
+        resolution: Tuple[int, int] = (1280, 720),
+        pos: Tuple[float, float, float] = (6.0, -6.0, 4.0),
+        lookat: Tuple[float, float, float] = (0.0, 0.0, 0.5),
+        fov: float = 45.0,
+        gui: bool = False,
+    ) -> Any:
+        """Register an offscreen camera for rendering / video capture (CONSTRUCTION).
+
+        Optional capability. Raises NotImplementedError if unsupported.
+        """
+        raise NotImplementedError("this backend does not support cameras")
+
+    def set_camera_pose(
+        self,
+        name: str,
+        pos: Optional[Tuple[float, float, float]] = None,
+        lookat: Optional[Tuple[float, float, float]] = None,
+    ) -> None:
+        """Reposition a registered camera mid-simulation.
+
+        Optional capability. Raises NotImplementedError if unsupported.
+        """
+        raise NotImplementedError("this backend does not support cameras")
+
+    def start_camera_recording(self, name: str) -> None:
+        """Begin accumulating rendered frames for a camera into a video buffer.
+
+        Optional capability. Raises NotImplementedError if unsupported.
+        """
+        raise NotImplementedError("this backend does not support cameras")
+
+    def render_camera(self, name: str) -> Any:
+        """Render one frame from a camera; appends to the video when recording.
+
+        Optional capability. Raises NotImplementedError if unsupported.
+        """
+        raise NotImplementedError("this backend does not support cameras")
+
+    def stop_camera_recording(self, name: str, save_path: str, fps: int = 30) -> None:
+        """Finalize a camera recording and encode it to ``save_path``.
+
+        Optional capability. Raises NotImplementedError if unsupported.
+        """
+        raise NotImplementedError("this backend does not support cameras")
 
 
 # Import the concrete implementation so callers can do:

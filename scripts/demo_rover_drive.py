@@ -154,6 +154,12 @@ WORLD_BLEND_RADIUS_M = 9.0         # height blends to full terrain by here
 WORLD_SEED = 4242
 CABLE_LINK_COUNT = 28
 RUT_DECAL_COUNT = 80
+# gs.morphs.Terrain renders its visual mesh at the heightfield value, i.e. at
+# the same surface used for collision/placement, so no vertical compensation is
+# needed (the earlier apparent float was a detached-shadow artifact, not a real
+# z offset). Kept as a single tunable knob in case a future terrain config
+# reveals a real per-resolution offset.
+WORLD_TERRAIN_VISUAL_OFFSET_M = 0.0
 RUT_DROP_SPACING_M = 0.25          # advance distance between rut stamps
 WORLD_VISUAL_HZ = 30.0             # cable re-draping rate (decoupled from sim Hz)
 
@@ -733,6 +739,43 @@ class ArmBridge:
                 )
             except (AttributeError, TypeError):
                 pass
+
+    def hand_position_world(self) -> Optional[np.ndarray]:
+        """World-space position of the gripper hand (midpoint of the fingers).
+
+        Falls back to the distal arm link, then ``None`` if the arm links cannot
+        be resolved. Used to anchor the trailing cable at the gripper.
+        """
+        try:
+            links_pos = self._entity.get_links_pos()
+            links_pos = np.asarray(
+                links_pos.detach().cpu().numpy()
+                if hasattr(links_pos, "detach") else links_pos
+            ).reshape(-1, 3)
+        except Exception:
+            return None
+
+        def _link_idx(name: str) -> Optional[int]:
+            try:
+                link = self._entity.get_link(name=name)
+            except Exception:
+                return None
+            for attr in ("idx_local", "_idx_local", "idx", "_idx"):
+                idx = getattr(link, attr, None)
+                if idx is not None:
+                    return int(idx)
+            return None
+
+        idxs = [i for i in (_link_idx("gripper_left_finger"),
+                            _link_idx("gripper_right_finger")) if i is not None]
+        if not idxs:
+            distal = _link_idx(f"arm_link_{self._num_dof}")
+            if distal is not None:
+                idxs = [distal]
+        valid = [i for i in idxs if 0 <= i < len(links_pos)]
+        if not valid:
+            return None
+        return links_pos[valid].mean(axis=0).astype(np.float64)
 
 
 class WheelTorqueActuator:
@@ -1545,13 +1588,19 @@ class LunarWorld:
 
     # -- construction phase ---------------------------------------------
     def construct(self, engine: GenesisPhysicsEngine) -> None:
+        regolith = _surface((0.62, 0.60, 0.57))
+
+        # Rolling lunar relief. gs.morphs.Terrain renders its visual mesh at the
+        # heightfield value (same surface used for collision and get_terrain_height),
+        # so a single entity grounds the rover and props on the visible slope. The
+        # earlier "float" was a detached-shadow artifact, not a real z offset, so
+        # no vertical compensation is applied (see WORLD_TERRAIN_VISUAL_OFFSET_M).
         engine.add_terrain_entity(
             "lunar_terrain",
             self._height.astype(np.float32),
             [self._size, self._size],
         )
 
-        regolith = _surface((0.62, 0.60, 0.57))
         rock_surf = _surface((0.40, 0.39, 0.37))
         base_surf = _surface((0.75, 0.76, 0.80))
 
@@ -1642,11 +1691,16 @@ class LunarWorld:
             pass
 
     def _update_cable(self, engine: GenesisPhysicsEngine,
-                      rover_pos: np.ndarray, yaw: float) -> None:
-        # Cable leaves the chassis rear and runs to the moonbase spool, sagging
-        # under 1/6 g between the two ends.
-        rear = rover_pos[:2] - 0.35 * np.array([math.cos(yaw), math.sin(yaw)])
-        p0 = np.array([rear[0], rear[1], float(rover_pos[2]) - 0.05])
+                      rover_pos: np.ndarray, yaw: float,
+                      attach_xyz: Optional[np.ndarray] = None) -> None:
+        # Cable runs from its rover-side anchor to the moonbase spool, sagging
+        # under 1/6 g between the two ends. The anchor is the arm gripper when a
+        # hand position is supplied, otherwise the chassis rear.
+        if attach_xyz is not None:
+            p0 = np.asarray(attach_xyz, dtype=np.float64).reshape(3)
+        else:
+            rear = rover_pos[:2] - 0.35 * np.array([math.cos(yaw), math.sin(yaw)])
+            p0 = np.array([rear[0], rear[1], float(rover_pos[2]) - 0.05])
         p1 = np.array([self._anchor[0], self._anchor[1], self._anchor_z])
         span = float(np.linalg.norm(p1[:2] - p0[:2]))
         sag = min(0.45, 0.06 * span)
@@ -1701,20 +1755,21 @@ class LunarWorld:
 
     def step(self, engine: GenesisPhysicsEngine, rover_pos: np.ndarray,
              yaw: float, body_v: float,
-             wheel_omega: tuple[float, float], dt: float) -> None:
+             wheel_omega: tuple[float, float], dt: float,
+             cable_attach_xyz: Optional[np.ndarray] = None) -> None:
         # Redrape the cable at WORLD_VISUAL_HZ, not the 120 Hz physics rate —
         # re-posing every link every step is the bulk of the visual cost.
         self._vis_accum += dt
         if self._vis_accum >= self._vis_period:
             self._vis_accum = 0.0
-            self._update_cable(engine, rover_pos, yaw)
+            self._update_cable(engine, rover_pos, yaw, attach_xyz=cable_attach_xyz)
         # Rut stamps are self-throttled by travel distance.
         self._drop_ruts(engine, rover_pos, yaw, body_v, wheel_omega)
 
     def print_summary(self) -> None:
         print(
             f"  World       : {self._size:.0f} m lunar heightfield, "
-            f"{self._rock_count} rocks, moonbase + trailing cable, "
+            f"{self._rock_count} rocks, moonbase + gripper-anchored cable, "
             f"analytic rut decals"
         )
 
@@ -2248,8 +2303,15 @@ def main() -> int:
             if args.backend == "gpu"
             else "Initialising Genesis (first CPU run can take 0-5 min)"
         )
+        # Simple shadows on, with lifted ambient so shadowed faces stay readable.
+        vis_options = None
+        if args.record is not None:
+            vis_options = gs.options.VisOptions(
+                shadow=True, ambient_light=(0.3, 0.3, 0.3)
+            )
         with ProgressSpinner(configure_label):
-            engine.configure(cfg, show_viewer=not args.no_viewer, viewer_options=viewer_options)
+            engine.configure(cfg, show_viewer=not args.no_viewer,
+                             viewer_options=viewer_options, vis_options=vis_options)
 
         # Offscreen recording camera must be registered before build_scene().
         if args.record is not None:
@@ -2258,9 +2320,13 @@ def main() -> int:
                     output_path=args.record,
                     fps=args.record_fps,
                     track_body=ROVER_NAME,
-                    # Chase cam: behind-and-above, framed on the rover body.
-                    camera_offset=(-2.8, -2.8, 1.9),
-                    lookat_offset=(0.0, 0.0, 0.35),
+                    # Chase cam: behind and low, near-horizontal. A steeper
+                    # top-down angle makes the (directional) ground shadow detach
+                    # from the wheels and read as a float; this low angle keeps
+                    # the rover on the surface while the rolling relief still
+                    # shows across the horizon.
+                    camera_offset=(-3.0, -1.7, 0.45),
+                    lookat_offset=(0.0, 0.0, -0.05),
                 )
             )
             recorder.attach(engine)
@@ -2633,11 +2699,14 @@ def run_loop(
         wheel_actuator.apply(tau_left, tau_right)
         engine.step(dt, render=not args.no_viewer)
 
-        # 4b. Slide the trailing cable and stamp wheel-rut decals.
+        # 4b. Slide the trailing cable (anchored at the arm gripper) and stamp
+        # wheel-rut decals.
         if world is not None:
+            hand_xyz = arm_bridge.hand_position_world()
             world.step(
                 engine, rover_pos, yaw, body_v,
                 wheel_actuator.wheel_omega(), dt,
+                cable_attach_xyz=hand_xyz,
             )
 
         # 5. Power accounting.
