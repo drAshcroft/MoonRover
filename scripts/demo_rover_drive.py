@@ -24,8 +24,17 @@ terminal key poller stays active as a fallback when the console is focused.
     [ / ]        jog selected joint − / +           (rad)
     O / C        open / close gripper
     X            stow arm to neutral pose
+    G            grab the antenna (drive up to the moonbase first; uses IK)
+    P            place the carried antenna at the rover's front
+    A            toggle the auto-place tour (fills the 8x8 deploy grid)
     R            reset rover pose (respawn upright)
     ESC / Q      quit cleanly
+
+The antenna workflow: drive to the moonbase, press G to grab the antenna (the
+arm IKs onto it and it is slaved to the gripper, with its 4.5 kg gravity moment
+fed back as a balance disturbance so carrying it extended can topple the bot),
+drive out, then P to plant it. A runs the whole fetch-and-place loop across an
+8x8 grid autonomously.
 
 The viewer scene is a finite lunar heightfield (gentle near the spawn pad so
 the balancer stays upright), with scattered rocks, the moonbase, a trailing
@@ -63,7 +72,7 @@ import os
 import sys
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -163,6 +172,19 @@ WORLD_TERRAIN_VISUAL_OFFSET_M = 0.0
 RUT_DROP_SPACING_M = 0.25          # advance distance between rut stamps
 WORLD_VISUAL_HZ = 30.0             # cable re-draping rate (decoupled from sim Hz)
 
+# Antenna manipulation demo (G grab / P place / A auto-place).
+# One real rigid antenna is grabbed/carried/recycled; placements are recorded
+# as a pool of visual-only marker boxes (collision off, like the cable/rut
+# pools) so the 8x8 = 64-cell grid never approaches the Genesis snode cap that
+# blocks the production multi-antenna URDF array (see record_mission.py).
+ANTENNA_MASS_KG = 4.5              # carried-antenna mass (drives synthetic load)
+ANTENNA_GRID_COLS = 8
+ANTENNA_GRID_ROWS = 8
+ANTENNA_MARKER_COUNT = ANTENNA_GRID_COLS * ANTENNA_GRID_ROWS  # 64 placements
+ANTENNA_GRID_SPACING_M = 2.0      # cell pitch -> 8x8 spans ~14 x 14 m
+ANTENNA_BODY_SIZE_M = (0.30, 0.30, 0.90)   # folded antenna proxy (graspable)
+ANTENNA_MARKER_SIZE_M = (0.22, 0.22, 0.70)  # standing marker left on the surface
+
 DEFAULT_PROFILE = "two_wheel_diff"
 DEFAULT_PHYSICS = _PROJECT_ROOT / "configs" / "physics.yaml"
 DEFAULT_ROVER = _PROJECT_ROOT / "configs" / "rover.yaml"
@@ -222,6 +244,11 @@ def parse_args() -> argparse.Namespace:
                              "uses the rich world scene even without a viewer.")
     parser.add_argument("--record-fps", type=int, default=30,
                         help="Frame rate for --record video. Default 30.")
+    parser.add_argument("--auto-place", action="store_true",
+                        help="Engage the antenna auto-place tour at startup: the "
+                             "rover fetches an antenna from the moonbase and fills "
+                             "the 8x8 deployment grid (same as pressing A). Needs "
+                             "the lunar world scene.")
     return parser.parse_args()
 
 
@@ -442,6 +469,9 @@ class ViewerControls:
             ("mr_grip_open", Key.O, "o", press),
             ("mr_grip_close", Key.C, "c", press),
             ("mr_arm_stow", Key.X, "x", press),
+            ("mr_ant_grab", Key.G, "g", press),
+            ("mr_ant_place", Key.P, "p", press),
+            ("mr_ant_auto", Key.A, "a", press),
             ("mr_reset", Key.R, "r", press),
             ("mr_nav_start", Key.F5, "F5", press),
             ("mr_quit", Key.Q, "q", press),
@@ -1556,6 +1586,30 @@ class LunarWorld:
         self._vis_accum = 1.0e9    # force a cable redrape on the first step
         self._vis_period = 1.0 / WORLD_VISUAL_HZ
 
+        # --- Antenna manipulation demo geometry -----------------------------
+        # The antenna lives at a pickup pad just inboard of the moonbase anchor
+        # so the operator can drive "up to the mothership" and grab it. Pull it
+        # 1.6 m toward the spawn pad from the anchor so it sits on gentler ground
+        # and within the rover's drive-up envelope.
+        to_center = self._center - self._anchor
+        to_center /= max(float(np.linalg.norm(to_center)), 1e-6)
+        self._antenna_pickup_xy = self._anchor + to_center * 1.6
+        self._marker_n = ANTENNA_MARKER_COUNT
+        self._marker_idx = 0
+        # 8x8 deployment grid, 2 m pitch, parked on drivable terrain offset to
+        # the +x/+y side of the spawn pad and clear of the moonbase corner.
+        gx0 = self._center[0] + 3.0 - 0.5 * (ANTENNA_GRID_COLS - 1) * ANTENNA_GRID_SPACING_M
+        gy0 = self._center[1] + 3.0 - 0.5 * (ANTENNA_GRID_ROWS - 1) * ANTENNA_GRID_SPACING_M
+        self._grid_xy: list[np.ndarray] = []
+        for r in range(ANTENNA_GRID_ROWS):
+            for c in range(ANTENNA_GRID_COLS):
+                self._grid_xy.append(
+                    np.array([gx0 + c * ANTENNA_GRID_SPACING_M,
+                              gy0 + r * ANTENNA_GRID_SPACING_M], dtype=np.float64)
+                )
+        self._antenna_body_half_h = ANTENNA_BODY_SIZE_M[2] * 0.5
+        self._marker_half_h = ANTENNA_MARKER_SIZE_M[2] * 0.5
+
     # -- geometry helpers ------------------------------------------------
     @property
     def center(self) -> tuple[float, float]:
@@ -1672,6 +1726,38 @@ class LunarWorld:
                 gs.materials.Rigid(), **rut_kw,
             )
 
+        # Antenna pickup: a single REAL rigid body the arm grabs, carries, and
+        # recycles. Density is back-solved so the proxy weighs ANTENNA_MASS_KG,
+        # which feeds the synthetic carry-load disturbance on the balancer.
+        ax_p, ay_p = float(self._antenna_pickup_xy[0]), float(self._antenna_pickup_xy[1])
+        body_vol = float(np.prod(ANTENNA_BODY_SIZE_M))
+        antenna_rho = ANTENNA_MASS_KG / max(body_vol, 1e-6)
+        ant_surf = _surface((0.85, 0.78, 0.30))  # gold-ish so it reads as an antenna
+        ant_kw = {}
+        if ant_surf is not None:
+            ant_kw["surface"] = ant_surf
+        antenna_z = self.ground_z(ax_p, ay_p) + self._antenna_body_half_h
+        self._antenna_spawn = np.array([ax_p, ay_p, antenna_z], dtype=np.float64)
+        engine.add_entity(
+            "antenna_payload",
+            gs.morphs.Box(pos=(ax_p, ay_p, antenna_z), size=ANTENNA_BODY_SIZE_M),
+            gs.materials.Rigid(rho=antenna_rho, friction=0.9),
+            **ant_kw,
+        )
+
+        # Deployment-marker pool: visual-only standing boxes, parked deep
+        # underground until a placement stamps one onto the surface.
+        marker_surf = _surface((0.80, 0.30, 0.20))  # rust-red placed beacons
+        marker_kw = {"entity_type": "kinematic"}
+        if marker_surf is not None:
+            marker_kw["surface"] = marker_surf
+        for i in range(self._marker_n):
+            engine.add_entity(
+                f"antenna_marker_{i:03d}",
+                _visual_box(pos=(0.0, 0.0, -120.0 - i), size=ANTENNA_MARKER_SIZE_M),
+                gs.materials.Rigid(), **marker_kw,
+            )
+
     # -- simulation phase ------------------------------------------------
     @staticmethod
     def _yaw_quat(yaw: float) -> np.ndarray:
@@ -1766,11 +1852,60 @@ class LunarWorld:
         # Rut stamps are self-throttled by travel distance.
         self._drop_ruts(engine, rover_pos, yaw, body_v, wheel_omega)
 
+    # -- antenna manipulation -------------------------------------------
+    @property
+    def antenna_pickup_xy(self) -> np.ndarray:
+        """World XY of the antenna pickup pad by the moonbase."""
+        return self._antenna_pickup_xy.copy()
+
+    @property
+    def grid_cells(self) -> list[np.ndarray]:
+        """The 8x8 deployment-grid cell centres (world XY), row-major."""
+        return [c.copy() for c in self._grid_xy]
+
+    def antenna_grasp_xyz(self) -> np.ndarray:
+        """World grasp point of the parked antenna (near the top of the body)."""
+        x, y = float(self._antenna_spawn[0]), float(self._antenna_spawn[1])
+        return np.array([x, y, self.ground_z(x, y) + ANTENNA_BODY_SIZE_M[2] * 0.8],
+                        dtype=np.float64)
+
+    def reset_antenna_to_pickup(self, engine: GenesisPhysicsEngine) -> None:
+        """Return the real antenna body to its pickup pad, at rest."""
+        self._place(engine, "antenna_payload", self._antenna_spawn,
+                    np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+
+    def slave_antenna(self, engine: GenesisPhysicsEngine,
+                      hand_xyz: np.ndarray, yaw: float) -> None:
+        """Pose-slave the carried antenna so it hangs below the gripper hand."""
+        pos = np.asarray(hand_xyz, dtype=np.float64).reshape(3).copy()
+        pos[2] -= self._antenna_body_half_h  # body centre hangs under the hand
+        self._place(engine, "antenna_payload", pos, self._yaw_quat(yaw))
+
+    def stamp_marker(self, engine: GenesisPhysicsEngine,
+                     xy: np.ndarray, yaw: float) -> int:
+        """Drop the next visual deployment marker standing on the surface.
+
+        Returns the running count of markers placed (wraps the fixed pool).
+        """
+        cx = float(np.clip(xy[0], 0.0, self._size))
+        cy = float(np.clip(xy[1], 0.0, self._size))
+        gz = self.ground_z(cx, cy) + self._marker_half_h
+        self._place(engine, f"antenna_marker_{self._marker_idx:03d}",
+                    np.array([cx, cy, gz], dtype=np.float64), self._yaw_quat(yaw))
+        self._marker_idx = (self._marker_idx + 1) % self._marker_n
+        return self._marker_idx
+
     def print_summary(self) -> None:
         print(
             f"  World       : {self._size:.0f} m lunar heightfield, "
             f"{self._rock_count} rocks, moonbase + gripper-anchored cable, "
             f"analytic rut decals"
+        )
+        print(
+            f"  Antenna     : pickup at moonbase "
+            f"({self._antenna_pickup_xy[0]:.1f},{self._antenna_pickup_xy[1]:.1f}); "
+            f"{ANTENNA_GRID_COLS}x{ANTENNA_GRID_ROWS} deploy grid @ "
+            f"{ANTENNA_GRID_SPACING_M:.0f} m ({self._marker_n} markers)"
         )
 
 
@@ -1800,6 +1935,7 @@ def print_header(args: argparse.Namespace, profile: dict) -> None:
         print("  Keys (click the 3-D window first so it has keyboard focus):")
         print("        Up/Down drive  Left/Right spin (hold to keep going)  Space stop")
         print("        1..4 select joint   [ / ] jog joint  O/C gripper  X stow")
+        print("        G grab antenna (near moonbase)  P place it  A auto-fill 8x8 grid")
         print("        R reset pose   ESC/Q quit")
         if args.navigation:
             print("        F5 start the autonomous navigation tour (planner+MPC)")
@@ -2227,6 +2363,287 @@ class NavigationDriver:
 
 
 # ---------------------------------------------------------------------------
+# Antenna manipulation mission (G grab / P place / A auto-place)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MissionStep:
+    """Per-step output from :class:`ManipulationMission`.
+
+    ``override`` is True only while auto-place owns the drive command; manual
+    driving stays with the operator otherwise. ``disturbance_tau`` is a common
+    -mode wheel-torque bias (N·m) emulating the carried antenna's gravity moment
+    so the balancer genuinely fights the load. ``request_reset`` asks the run
+    loop to respawn the rover (used by auto fall-recovery).
+    """
+
+    v_cmd: float = 0.0
+    w_cmd: float = 0.0
+    override: bool = False
+    disturbance_tau: float = 0.0
+    request_reset: bool = False
+
+
+class ManipulationMission:
+    """Grab / carry / place an antenna with the arm, manually or on autopilot.
+
+    The engine has no runtime weld (Genesis 0.4.4), so a grabbed antenna is
+    pose-slaved to the gripper hand every step. To keep the physics honest the
+    mission also injects a synthetic disturbance torque equal to the antenna's
+    gravity moment about the wheel axle (``m·g·fore_offset``): stow the arm and
+    the moment is small and survivable; carry it extended and it can topple the
+    inverted pendulum — exactly the behaviour a real 4.5 kg payload would force.
+
+    Manual keys: ``G`` grab (must be within arm reach of the pickup), ``P``
+    place (stamps a marker, recycles the real antenna). ``A`` toggles the auto
+    fetch-and-return tour that fills the 8x8 grid: for each cell, drive to the
+    moonbase pickup, grab, drive to the cell, place. A fall during the tour
+    triggers a respawn-and-retry; after :data:`_MAX_RETRIES` the cell is stamped
+    anyway so the grid still completes.
+    """
+
+    _STOW_POSE = np.array([0.0, -1.55, -1.55, 0.0], dtype=np.float64)
+    _GRAB_RANGE_M = 1.6        # operator must be this close to the pickup
+    _PLACE_AHEAD_M = 0.6       # marker is stamped this far in front of the rover
+    _AUTO_V_MAX = 0.35         # balance-safe cruise for the auto tour
+    _AUTO_REACH_BASE_M = 1.4   # "arrived at pickup" radius
+    _AUTO_REACH_CELL_M = 0.45  # "arrived at cell" radius
+    _LOAD_GAIN = 1.0           # scales the emulated carry moment
+    _FALL_RAD = math.radians(55.0)
+    _MAX_RETRIES = 3
+
+    def __init__(
+        self,
+        world: "LunarWorld",
+        arm: SerialArm,
+        spawn_xy: tuple[float, float],
+        g_moon: float,
+        tau_cap: float,
+    ) -> None:
+        self._world = world
+        self._arm = arm
+        self._spawn_xy = np.array(spawn_xy, dtype=np.float64)
+        self._g = abs(float(g_moon)) or 1.622
+        self._tau_cap = float(tau_cap)
+        self._carrying = False
+        self._placed = 0
+        # Auto tour state.
+        self._auto = False
+        self._auto_state = "idle"   # go_base | grab | go_cell | place | done
+        self._cells = world.grid_cells
+        self._cell_idx = 0
+        self._retries = 0
+        self._last_msg = ""
+
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
+    @property
+    def carrying(self) -> bool:
+        return self._carrying
+
+    @property
+    def auto_active(self) -> bool:
+        return self._auto
+
+    def status_line(self) -> str:
+        mode = "AUTO" if self._auto else "manual"
+        held = "carry" if self._carrying else "empty"
+        return (
+            f"  ant | {mode} {self._auto_state} cell {self._cell_idx + 1}/"
+            f"{len(self._cells)} placed={self._placed} {held}"
+            + (f" | {self._last_msg}" if self._last_msg else "")
+        )
+
+    # ------------------------------------------------------------------
+    # Arm helpers
+    # ------------------------------------------------------------------
+    def _reach_for(self, rover_pos: np.ndarray, yaw: float,
+                   grasp_world: np.ndarray) -> bool:
+        """Point the arm at a world grasp target via IK (best effort)."""
+        delta = np.asarray(grasp_world, dtype=np.float64).reshape(3) - rover_pos
+        c, s = math.cos(-yaw), math.sin(-yaw)
+        body_target = np.array(
+            [c * delta[0] - s * delta[1], s * delta[0] + c * delta[1], delta[2]],
+            dtype=np.float64,
+        )
+        try:
+            q = self._arm.inverse_kinematics(body_target)
+            self._arm.set_joint_positions(np.asarray(q, dtype=np.float64))
+            return True
+        except Exception:  # noqa: BLE001 - IK miss/out-of-reach -> fall back to stow
+            self._arm.set_joint_positions(self._STOW_POSE.copy())
+            return False
+
+    def _stow(self) -> None:
+        self._arm.set_joint_positions(self._STOW_POSE.copy())
+
+    # ------------------------------------------------------------------
+    # Grab / place primitives (shared by manual keys and the auto tour)
+    # ------------------------------------------------------------------
+    def _do_grab(self, engine: GenesisPhysicsEngine,
+                 rover_pos: np.ndarray, yaw: float, *, enforce_range: bool) -> bool:
+        if self._carrying:
+            self._last_msg = "already carrying"
+            return False
+        pickup = self._world.antenna_pickup_xy
+        dist = float(np.linalg.norm(rover_pos[:2] - pickup))
+        if enforce_range and dist > self._GRAB_RANGE_M:
+            self._last_msg = f"too far from pickup ({dist:.1f} m) — drive closer"
+            return False
+        self._reach_for(rover_pos, yaw, self._world.antenna_grasp_xyz())
+        self._arm.command_gripper(0.0)   # close jaws
+        self._carrying = True
+        self._stow()                     # fold load close to the axle -> survivable
+        self._last_msg = "grabbed antenna"
+        return True
+
+    def _do_place(self, engine: GenesisPhysicsEngine,
+                  rover_pos: np.ndarray, yaw: float,
+                  cell_xy: Optional[np.ndarray] = None) -> bool:
+        if not self._carrying:
+            self._last_msg = "nothing to place"
+            return False
+        if cell_xy is not None:
+            drop = np.asarray(cell_xy, dtype=np.float64).reshape(2)
+        else:
+            fwd = np.array([math.cos(yaw), math.sin(yaw)])
+            drop = rover_pos[:2] + fwd * self._PLACE_AHEAD_M
+        self._world.stamp_marker(engine, drop, yaw)
+        self._world.reset_antenna_to_pickup(engine)  # recycle the real body
+        self._carrying = False
+        self._placed += 1
+        self._arm.command_gripper(1.0)   # open jaws
+        self._stow()
+        self._last_msg = f"placed #{self._placed} at ({drop[0]:.1f},{drop[1]:.1f})"
+        return True
+
+    # ------------------------------------------------------------------
+    # Manual key handlers
+    # ------------------------------------------------------------------
+    def grab(self, engine: GenesisPhysicsEngine,
+             rover_pos: np.ndarray, yaw: float) -> None:
+        if self._auto:
+            return
+        self._do_grab(engine, rover_pos, yaw, enforce_range=True)
+        print(self.status_line())
+
+    def place(self, engine: GenesisPhysicsEngine,
+              rover_pos: np.ndarray, yaw: float) -> None:
+        if self._auto:
+            return
+        self._do_place(engine, rover_pos, yaw)
+        print(self.status_line())
+
+    def toggle_auto(self) -> None:
+        self._auto = not self._auto
+        if self._auto:
+            self._auto_state = "go_base" if not self._carrying else "go_cell"
+            self._retries = 0
+            self._last_msg = "auto-place engaged"
+        else:
+            self._last_msg = "auto-place paused (manual control)"
+        print(self.status_line())
+
+    # ------------------------------------------------------------------
+    # Per-step update
+    # ------------------------------------------------------------------
+    def _carry_disturbance(self, rover_pos: np.ndarray, yaw: float,
+                           hand_xyz: Optional[np.ndarray]) -> float:
+        if not self._carrying or hand_xyz is None:
+            return 0.0
+        delta = np.asarray(hand_xyz, dtype=np.float64).reshape(3)[:2] - rover_pos[:2]
+        fwd = np.array([math.cos(yaw), math.sin(yaw)])
+        d_fore = float(np.dot(delta, fwd))
+        # Forward-offset load pitches the body forward; emulate the unmodeled
+        # external moment as a common-mode wheel-torque disturbance the balance
+        # feedback must counter (and may be unable to, hence topple).
+        tau = -self._LOAD_GAIN * ANTENNA_MASS_KG * self._g * d_fore
+        return float(max(-self._tau_cap, min(self._tau_cap, tau)))
+
+    def _go_to(self, rover_pos: np.ndarray, yaw: float,
+               target_xy: np.ndarray, reach_m: float) -> tuple[float, float, bool]:
+        delta = np.asarray(target_xy, dtype=np.float64).reshape(2) - rover_pos[:2]
+        dist = float(np.linalg.norm(delta))
+        if dist < reach_m:
+            return 0.0, 0.0, True
+        desired_yaw = math.atan2(delta[1], delta[0])
+        yaw_err = math.atan2(math.sin(desired_yaw - yaw), math.cos(desired_yaw - yaw))
+        if abs(yaw_err) > 0.5:                       # turn in place first
+            return 0.0, max(-0.7, min(0.7, 2.0 * yaw_err)), False
+        v = min(self._AUTO_V_MAX, 0.4 * dist)
+        return v, max(-0.7, min(0.7, 1.5 * yaw_err)), False
+
+    def step(
+        self,
+        engine: GenesisPhysicsEngine,
+        rover_pos: np.ndarray,
+        yaw: float,
+        pitch: float,
+        roll: float,
+        hand_xyz: Optional[np.ndarray],
+    ) -> MissionStep:
+        # Carried antenna rides the gripper hand every step (visual + slaved).
+        if self._carrying and hand_xyz is not None:
+            self._world.slave_antenna(engine, hand_xyz, yaw)
+        result = MissionStep(disturbance_tau=self._carry_disturbance(rover_pos, yaw, hand_xyz))
+
+        if not self._auto:
+            return result
+        result.override = True
+
+        # Fall recovery: respawn at the pad, drop the load, retry the cell.
+        if abs(pitch) > self._FALL_RAD or abs(roll) > self._FALL_RAD:
+            self._retries += 1
+            if self._carrying:
+                self._carrying = False
+                self._world.reset_antenna_to_pickup(engine)
+                self._stow()
+            if self._retries > self._MAX_RETRIES:
+                # Give up on the carry for this cell but still complete the grid.
+                self._world.stamp_marker(engine, self._cells[self._cell_idx], yaw)
+                self._placed += 1
+                self._last_msg = f"cell {self._cell_idx + 1} skipped after falls"
+                self._advance_cell()
+            else:
+                self._last_msg = f"fall -> respawn (retry {self._retries})"
+                self._auto_state = "go_base"
+            result.request_reset = True
+            return result
+
+        if self._auto_state == "go_base":
+            v, w, reached = self._go_to(rover_pos, yaw,
+                                        self._world.antenna_pickup_xy,
+                                        self._AUTO_REACH_BASE_M)
+            result.v_cmd, result.w_cmd = v, w
+            if reached:
+                self._do_grab(engine, rover_pos, yaw, enforce_range=False)
+                self._auto_state = "go_cell"
+        elif self._auto_state == "go_cell":
+            target = self._cells[self._cell_idx]
+            v, w, reached = self._go_to(rover_pos, yaw, target, self._AUTO_REACH_CELL_M)
+            result.v_cmd, result.w_cmd = v, w
+            if reached:
+                self._do_place(engine, rover_pos, yaw, cell_xy=target)
+                self._retries = 0
+                self._advance_cell()
+        elif self._auto_state == "done":
+            result.v_cmd, result.w_cmd = 0.0, 0.0
+        return result
+
+    def _advance_cell(self) -> None:
+        self._cell_idx += 1
+        if self._cell_idx >= len(self._cells):
+            self._auto_state = "done"
+            self._auto = False
+            self._last_msg = f"grid complete — {self._placed} antennas placed"
+            print(self.status_line())
+        else:
+            self._auto_state = "go_base"
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -2239,7 +2656,7 @@ def main() -> int:
     if args.record is not None:
         args.no_viewer = True
         args.no_keyboard = True
-        if not args.navigation and not args.capability_demo:
+        if not args.navigation and not args.capability_demo and not args.auto_place:
             args.self_test = True
         if not args.steps:
             # The --self-test command sequence runs ~22 s of sim; give a tail.
@@ -2473,6 +2890,22 @@ def main() -> int:
         )
         balance = BalanceController(max_torque_nm=tau_cap)
 
+        # Antenna manipulation mission (G grab / P place / A auto-place). Lives
+        # in the lunar world only — the flat-ground / no-world path has no
+        # antenna pickup or deploy grid.
+        mission: Optional[ManipulationMission] = None
+        if world is not None:
+            mission = ManipulationMission(
+                world, arm, spawn_xy,
+                g_moon=abs(float(cfg.gravity_vector[2])) or 1.622,
+                tau_cap=tau_cap,
+            )
+            if args.auto_place:
+                mission.toggle_auto()
+        elif args.auto_place:
+            print("  [auto-place] requires the lunar world scene; ignoring "
+                  "(flat-ground or headless-no-world).")
+
         keyboard = None
         viewer_controls = None
         if not args.no_viewer and not args.no_keyboard:
@@ -2493,7 +2926,7 @@ def main() -> int:
             engine, drive, wheel_actuator, power, arm, arm_bridge, balance,
             keyboard, cfg, args, spawn_z, capability_demo,
             world=world, spawn_xy=spawn_xy, viewer_controls=viewer_controls,
-            navigation=navigation, recorder=recorder,
+            navigation=navigation, recorder=recorder, mission=mission,
         )
         completed_cleanly = True
 
@@ -2548,6 +2981,7 @@ def run_loop(
     viewer_controls: Optional[ViewerControls] = None,
     navigation: Optional[NavigationDriver] = None,
     recorder: Optional[VideoRecorder] = None,
+    mission: Optional[ManipulationMission] = None,
 ) -> None:
     dt = cfg.timestep
     step_count = 0
@@ -2568,6 +3002,8 @@ def run_loop(
     w_step = 0.3  # rad/s per A/D press
     next_nav_report_wall = 0.0
     last_nav_info: dict = {}
+    next_mission_report_wall = 0.0
+    grab_req = place_req = auto_req = False
 
     while True:
         t = engine.get_sim_time()
@@ -2643,6 +3079,12 @@ def run_loop(
                     arm.command_gripper(0.0)
                 elif lower == "x":
                     arm.stow()
+                elif lower == "g":
+                    grab_req = True
+                elif lower == "p":
+                    place_req = True
+                elif lower == "a":
+                    auto_req = True
                 elif lower == "r":
                     _reset_pose(engine, spawn_z, spawn_xy)
                     balance.reset()
@@ -2682,6 +3124,35 @@ def run_loop(
             if navigation.is_started():
                 v_user, w_user = nav_v, nav_w
 
+        # Antenna manipulation: service G/P/A key requests, then advance the
+        # mission (carry-slaving + synthetic load + the auto tour). The carried
+        # antenna's gravity moment is added to the wheel torque after balance.
+        mission_disturbance = 0.0
+        hand_xyz = (
+            arm_bridge.hand_position_world() if (world is not None) else None
+        )
+        if mission is not None:
+            if grab_req:
+                mission.grab(engine, rover_pos, yaw)
+            if place_req:
+                mission.place(engine, rover_pos, yaw)
+            if auto_req:
+                mission.toggle_auto()
+            mstep = mission.step(engine, rover_pos, yaw, pitch, roll, hand_xyz)
+            mission_disturbance = mstep.disturbance_tau
+            if mstep.request_reset:
+                _reset_pose(engine, spawn_z, spawn_xy)
+                balance.reset()
+                prev_yaw = None
+                v_user = w_user = 0.0
+                grab_req = place_req = auto_req = False
+                engine.step(dt, render=not args.no_viewer)
+                step_count += 1
+                continue
+            if mstep.override:
+                v_user, w_user = mstep.v_cmd, mstep.w_cmd
+        grab_req = place_req = auto_req = False
+
         tau_left, tau_right = balance.step(
             pitch_rad=pitch,
             body_v_mps=body_v,
@@ -2690,6 +3161,13 @@ def run_loop(
             w_ref_radps=w_user,
             dt=dt,
         )
+
+        # Carried-antenna load: a common-mode wheel-torque bias the balance
+        # feedback must fight (and may be unable to, hence topple if extended).
+        if mission_disturbance:
+            lim = balance.max_torque
+            tau_left = max(-lim, min(lim, tau_left + mission_disturbance))
+            tau_right = max(-lim, min(lim, tau_right + mission_disturbance))
 
         # 3. Arm: update software state, push into Genesis.
         arm.update(dt)
@@ -2702,7 +3180,6 @@ def run_loop(
         # 4b. Slide the trailing cable (anchored at the arm gripper) and stamp
         # wheel-rut decals.
         if world is not None:
-            hand_xyz = arm_bridge.hand_position_world()
             world.step(
                 engine, rover_pos, yaw, body_v,
                 wheel_actuator.wheel_omega(), dt,
@@ -2792,6 +3269,11 @@ def run_loop(
                 f"v_max={v_max:.2f} v_cmd={v_user:+.2f} w_cmd={w_user:+.2f}"
             )
             next_nav_report_wall = now + 1.0  # 1 Hz nav telemetry
+
+        if mission is not None and (mission.auto_active or mission.carrying) \
+                and now >= next_mission_report_wall:
+            print(mission.status_line())
+            next_mission_report_wall = now + 1.0  # 1 Hz antenna telemetry
 
         # Safety: if the rover falls flat, call it out — balance controller failed.
         if abs(pitch) > math.radians(70.0) or abs(roll) > math.radians(70.0):
